@@ -132,18 +132,57 @@ public final class GoogleOAuth: @unchecked Sendable {
 
     // MARK: - Loopback listener
 
-    /// One-shot HTTP listener on an ephemeral loopback port; resolves with
-    /// the `code` query parameter of the first /callback request.
+    /// One-shot HTTP listener bound to an explicit high port on loopback;
+    /// resolves with the `code` query parameter of the first /callback
+    /// request. The port is chosen before building the redirect URI, and the
+    /// browser is only opened once the listener reports ready — never a
+    /// ":0" redirect.
     private func startLoopbackListener() throws -> (UInt16, Task<String, Error>) {
-        let listener = try NWListener(using: .tcp, on: .any)
+        var lastError: Error = OAuthError.flowFailed("could not open loopback listener")
+        for _ in 0..<10 {
+            let port = UInt16.random(in: 49152...65500)
+            do {
+                return (port, try listen(on: port))
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    private func listen(on port: UInt16) throws -> Task<String, Error> {
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
+            host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
+        let listener = try NWListener(using: parameters)
+
+        // Wait for ready/failed before returning, so a port collision is
+        // retried instead of sending the browser to a dead port.
+        let readySemaphore = DispatchSemaphore(value: 0)
+        let readyState = LockedBox<NWListener.State>(.setup)
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready, .failed, .cancelled:
+                readyState.set(state)
+                readySemaphore.signal()
+            default:
+                break
+            }
+        }
+
+        let resumed = ResumeGuard()
         let task = Task<String, Error> {
             try await withCheckedThrowingContinuation { continuation in
-                let resumed = ResumeGuard()
                 listener.newConnectionHandler = { connection in
                     connection.start(queue: .global())
                     connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, _ in
                         let request = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                         let firstLine = request.split(separator: "\r\n").first ?? ""
+                        // Ignore stray probes (favicon etc.) that aren't the callback.
+                        guard firstLine.contains("/callback") else {
+                            connection.cancel()
+                            return
+                        }
                         let result: Result<String, Error>
                         let page: String
                         if let range = firstLine.range(of: #"code=([^&\s]+)"#, options: .regularExpression) {
@@ -166,18 +205,27 @@ public final class GoogleOAuth: @unchecked Sendable {
                 listener.start(queue: .global())
             }
         }
-        // Wait for the listener to pick its port.
-        var attempts = 0
-        while listener.port == nil, attempts < 100 {
-            usleep(10_000)
-            attempts += 1
-        }
-        guard let port = listener.port?.rawValue else {
+
+        if readySemaphore.wait(timeout: .now() + 3) == .timedOut {
             listener.cancel()
-            throw OAuthError.flowFailed("could not open loopback listener")
+            task.cancel()
+            throw OAuthError.flowFailed("loopback listener timed out while starting")
         }
-        return (port, task)
+        guard case .ready = readyState.get() else {
+            listener.cancel()
+            task.cancel()
+            throw OAuthError.flowFailed("loopback port \(port) unavailable")
+        }
+        return task
     }
+}
+
+private final class LockedBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T
+    init(_ value: T) { self.value = value }
+    func set(_ new: T) { lock.lock(); value = new; lock.unlock() }
+    func get() -> T { lock.lock(); defer { lock.unlock() }; return value }
 }
 
 /// Ensures a continuation resumes exactly once even if multiple connections
