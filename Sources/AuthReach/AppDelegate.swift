@@ -50,7 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         menu.addItem(.separator())
-        menu.addItem({ let i = NSMenuItem(title: "Open AuthReach…", action: #selector(openMain), keyEquivalent: ""); i.target = self; return i }())
+        menu.addItem({ let i = NSMenuItem(title: "Settings…", action: #selector(openMain), keyEquivalent: ""); i.target = self; return i }())
         menu.addItem({ let i = NSMenuItem(title: "Check now", action: #selector(checkNow), keyEquivalent: ""); i.target = self; return i }())
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit AuthReach", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -132,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mainMenu = NSMenu()
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem({ let i = NSMenuItem(title: "Open AuthReach…", action: #selector(openMain), keyEquivalent: "o"); i.target = self; return i }())
+        appMenu.addItem({ let i = NSMenuItem(title: "Settings…", action: #selector(openMain), keyEquivalent: ","); i.target = self; return i }())
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit AuthReach", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu

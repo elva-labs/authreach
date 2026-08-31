@@ -1,13 +1,13 @@
 {
-  "originHash" : "8fb51b93aa828632f9e64b12e13008ffaf00f1058e4fff99ff3d72c4f35f82bc",
+  "originHash" : "e64a45c6e95c34f00c40f5a7a0d463ee03be3df40d8180c95859432d024276ff",
   "pins" : [
     {
       "identity" : "keyboardshortcuts",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/sindresorhus/KeyboardShortcuts",
+      "location" : "https://github.com/elva-labs/KeyboardShortcuts",
       "state" : {
-        "revision" : "1aef85578fdd4f9eaeeb8d53b7b4fc31bf08fe27",
-        "version" : "2.4.0"
+        "revision" : "471fd405fbb5ad1abd0bdb8165a6769c39e0a200",
+        "version" : "2.4.0-elva.1"
       }
     }
   ],
