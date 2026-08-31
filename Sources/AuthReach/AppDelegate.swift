@@ -94,11 +94,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             hudPanel = panel
         }
         guard let panel = hudPanel else { return }
-        // Anchor near the status item (its screen), top-center under the menu bar.
-        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
-        if let visible = screen?.visibleFrame {
-            panel.layoutIfNeeded()
-            let size = panel.frame.size
+        panel.layoutIfNeeded()
+        let size = panel.frame.size
+        // Anchor directly under the tray icon, clamped to its screen.
+        if let button = statusItem?.button, let window = button.window, let screen = window.screen {
+            let anchor = window.frame
+            let visible = screen.visibleFrame
+            let x = min(max(anchor.midX - size.width / 2, visible.minX + 8),
+                        visible.maxX - size.width - 8)
+            panel.setFrameOrigin(NSPoint(x: x, y: anchor.minY - size.height - 6))
+        } else if let visible = NSScreen.main?.visibleFrame {
             panel.setFrameOrigin(NSPoint(x: visible.midX - size.width / 2,
                                          y: visible.maxY - size.height - 8))
         }

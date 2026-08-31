@@ -1,5 +1,6 @@
 import AuthReachCore
 import KeyboardShortcuts
+import ServiceManagement
 import SwiftUI
 
 struct MainView: View {
@@ -108,6 +109,7 @@ struct MainView: View {
     private var preferencesSection: some View {
         Section("Preferences") {
             KeyboardShortcuts.Recorder("Code HUD shortcut:", name: .toggleHud)
+            LaunchAtLoginToggle()
             Toggle("Copy new codes automatically", isOn: binding(\.autoCopy))
             Toggle("Notify when a code arrives", isOn: binding(\.notify))
             Picker("Check inboxes every", selection: binding(\.pollIntervalSec)) {
@@ -190,5 +192,30 @@ struct CredentialsSheet: View {
         }
         .padding(16)
         .frame(width: 440)
+    }
+}
+
+
+struct LaunchAtLoginToggle: View {
+    @State private var enabled = SMAppService.mainApp.status == .enabled
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle("Launch at login", isOn: $enabled)
+                .onChange(of: enabled) { newValue in
+                    do {
+                        if newValue { try SMAppService.mainApp.register() }
+                        else { try SMAppService.mainApp.unregister() }
+                        error = nil
+                    } catch {
+                        self.error = error.localizedDescription
+                        enabled = SMAppService.mainApp.status == .enabled
+                    }
+                }
+            if let error {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+        }
     }
 }
