@@ -139,4 +139,20 @@ final class GmailParsingTests: XCTestCase {
         let msg = try JSONDecoder().decode(GmailClient.Message.self, from: Data(json.utf8))
         XCTAssertEqual(GmailClient.fetchedMessage(from: msg).text, "Your login code is 445566")
     }
+
+    func testHtmlEntitiesAreDecoded() {
+        XCTAssertEqual(
+            stripHtml("<p>Din eng&aring;ngskod &auml;r <b>481920</b>. Koden g&auml;ller i 10 minuter.</p>"),
+            "Din engångskod är 481920 . Koden gäller i 10 minuter.")
+        XCTAssertEqual(stripHtml("Din s&#228;kerhetskod &#xE4;r 481920"), "Din säkerhetskod är 481920")
+        // Single pass: a double-escaped entity stays literal.
+        XCTAssertEqual(stripHtml("Tom &amp; Jerry &amp;auml; &unknown; &nbsp;x"), "Tom & Jerry &auml; &unknown; x")
+        XCTAssertEqual(stripHtml("&lt;b&gt;&quot;hi&quot;&#39;"), "<b>\"hi\"'")
+    }
+
+    func testEntityEncodedHtmlOnlySwedishMailIsDetected() {
+        let text = stripHtml("<p>Din s&auml;kerhetskod &auml;r <b>481920</b>. Koden g&auml;ller i 10 minuter.</p>")
+        XCTAssertEqual(OtpDetector.detectCode(in: text), "481920")
+        XCTAssertEqual(OtpDetector.detectExpirySeconds(in: text), 600)
+    }
 }
