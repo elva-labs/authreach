@@ -29,6 +29,27 @@ final class OtpDetectorTests: XCTestCase {
         XCTAssertNil(OtpDetector.detectCode(in: ""))
     }
 
+    func testSwedishCuedCodeForms() {
+        // Real TSV login mail (subject + plain-text body) that the
+        // English-only keyword gate used to reject.
+        XCTAssertEqual(
+            OtpDetector.detectCode(in: """
+            Din inloggningskod: 734585 — TSV Din inloggningskod för TSV: 734585 \
+            Koden fungerar bara en gång. Om du inte begärde den kan du ignorera detta mejl.
+            """),
+            "734585")
+        XCTAssertEqual(OtpDetector.detectCode(in: "Din engångskod är 481920"), "481920")
+        XCTAssertEqual(OtpDetector.detectCode(in: "Ange koden 12 34 56 för att logga in"), "123456")
+        XCTAssertEqual(OtpDetector.detectCode(in: "Verifieringskod: 9876"), "9876")
+    }
+
+    func testSwedishKeywordGateStillRejectsOrdinaryMail() {
+        XCTAssertNil(OtpDetector.detectCode(in: "Din order 483920 har skickats och kommer på tisdag"))
+        XCTAssertNil(OtpDetector.detectCode(in: "Faktura 2024, totalt 123456 kr"))
+        // "rabattkoden" must not leak through the \bkoden\b keyword.
+        XCTAssertNil(OtpDetector.detectCode(in: "Använd rabattkoden 483920 vid kassan"))
+    }
+
     func testYearsAreNotCodes() {
         XCTAssertNil(OtpDetector.detectCode(in: "Verify your account before 2026"))
     }
@@ -44,6 +65,12 @@ final class OtpDetectorTests: XCTestCase {
         XCTAssertEqual(OtpDetector.detectExpirySeconds(in: "valid for 5 min"), 300)
         XCTAssertEqual(OtpDetector.detectExpirySeconds(in: "will expire within the next 30 seconds"), 30)
         XCTAssertEqual(OtpDetector.detectExpirySeconds(in: "expires in 1 hour"), 3600)
+    }
+
+    func testSwedishExpiryDurations() {
+        XCTAssertEqual(OtpDetector.detectExpirySeconds(in: "Koden är giltig i 10 minuter"), 600)
+        XCTAssertEqual(OtpDetector.detectExpirySeconds(in: "gäller i 30 sekunder"), 30)
+        XCTAssertEqual(OtpDetector.detectExpirySeconds(in: "Koden går ut om 1 timme"), 3600)
     }
 
     func testExpiryClampsAndAbsolutesIgnored() {

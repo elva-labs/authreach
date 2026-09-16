@@ -8,26 +8,29 @@ import Foundation
 public enum OtpDetector {
 
     private static let keywords = try! NSRegularExpression(
-        pattern: #"\b(one[\s-]?time|verification|verify|verify code|security code|login|log[\s-]?in|sign[\s-]?in|auth(?:entication)?|otp|passcode|pass[\s-]?code|access code|confirm(?:ation)?|2fa|two[\s-]?factor|your code)\b"#,
+        pattern: #"\b(one[\s-]?time|verification|verify|verify code|security code|login|log[\s-]?in|sign[\s-]?in|auth(?:entication)?|otp|passcode|pass[\s-]?code|access code|confirm(?:ation)?|2fa|two[\s-]?factor|your code|inloggning(?:skod)?|logga[\s-]?in|verifierings?kod|engångskod|engångslösenord|säkerhetskod|bekräftelse(?:kod)?|aktiveringskod|tvåfaktor|din kod|koden)\b"#,
         options: [.caseInsensitive])
 
     /// A code preceded by a strong cue word, e.g. "code is 123456",
-    /// "OTP: 481920", "passcode 12 34 56". 4-8 digits, optionally split.
+    /// "OTP: 481920", "passcode 12 34 56", "koden är 481920". 4-8 digits,
+    /// optionally split.
     private static let cuedCode = try! NSRegularExpression(
-        pattern: #"(?:code|otp|passcode|pass[\s-]?code|pin|password|is|:)\s*(?:is\s*)?[:#-]?\s*(\d[\d\s-]{2,10}\d)"#,
+        pattern: #"(?:code|otp|passcode|pass[\s-]?code|pin|password|kod(?:en)?|lösenord|is|är|:)\s*(?:(?:is|är)\s*)?[:#-]?\s*(\d[\d\s-]{2,10}\d)"#,
         options: [.caseInsensitive])
 
     private static let googleStyle = try! NSRegularExpression(pattern: #"\bG-(\d{4,8})\b"#)
 
     private static let standaloneDigits = try! NSRegularExpression(pattern: #"\b(\d{4,8})\b"#)
 
-    /// A duration near "expire"/"valid", e.g. "expires in 10 minutes".
+    /// A duration near "expire"/"valid", e.g. "expires in 10 minutes",
+    /// "giltig i 10 minuter".
     private static let expiryDuration = try! NSRegularExpression(
-        pattern: #"\b(?:expir\w*|valid)\b[\s\S]{0,25}?\b(\d{1,3})\s*(second|sec|minute|min|hour|hr)s?\b"#,
+        pattern: #"\b(?:expir\w*|valid|giltig\w*|gäller|går\s+ut|upphör\w*)\b[\s\S]{0,25}?\b(\d{1,3})\s*(sekund(?:er)?|second|sec|minut(?:er)?|minute|min|timm(?:e|ar)|hour|hr)s?\b"#,
         options: [.caseInsensitive])
 
     private static let unitSeconds: [String: Int] = [
         "second": 1, "sec": 1, "minute": 60, "min": 60, "hour": 3600, "hr": 3600,
+        "sekund": 1, "sekunder": 1, "minut": 60, "minuter": 60, "timme": 3600, "timmar": 3600,
     ]
 
     private static func isLikelyYear(_ digits: String) -> Bool {
