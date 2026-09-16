@@ -1,34 +1,55 @@
 import Foundation
 
-/// Heuristic one-time-password detector, ported behavior-for-behavior from
-/// the original TypeScript implementation. Given the combined text of an
-/// email (subject + snippet + body), decide whether it contains an OTP and
-/// extract the code. A keyword gate keeps ordinary mail with stray numbers
-/// from being misreported.
+/// Heuristic one-time-password detector, originally ported
+/// behavior-for-behavior from the TypeScript implementation and since
+/// extended with Swedish keywords, cues and expiry forms. Given the combined
+/// text of an email (subject + snippet + body), decide whether it contains an
+/// OTP and extract the code. A keyword gate keeps ordinary mail with stray
+/// numbers from being misreported.
 public enum OtpDetector {
 
+    /// Swedish "…kod" compounds, in both indefinite ("engångskod") and
+    /// definite ("engångskoden") form. Shared by the gate and the cue regex.
+    /// Bare "kod"/"koden" is deliberately not a gate word: it is as common in
+    /// discount-code marketing mail as English "code" is.
+    private static let swedishCodeNoun =
+        #"(?:engångs|säkerhets|verifierings?|verifikations|aktiverings|inloggnings|bekräftelse|pin[\s-]?|sms[\s-]?)kod(?:en)?"#
+
     private static let keywords = try! NSRegularExpression(
-        pattern: #"\b(one[\s-]?time|verification|verify|verify code|security code|login|log[\s-]?in|sign[\s-]?in|auth(?:entication)?|otp|passcode|pass[\s-]?code|access code|confirm(?:ation)?|2fa|two[\s-]?factor|your code)\b"#,
+        pattern: #"\b(one[\s-]?time|verification|verify|security code|log[\s-]?in|sign[\s-]?in|auth(?:entication)?|otp|pass[\s-]?code|access code|confirm(?:ation)?|2fa|two[\s-]?factor|your code|"# + swedishCodeNoun + #"|inloggning|logga[\s-]?in|engångslösenord|bekräftelse|tvåfaktor\w*|din kod)\b"#,
         options: [.caseInsensitive])
 
     /// A code preceded by a strong cue word, e.g. "code is 123456",
-    /// "OTP: 481920", "passcode 12 34 56". 4-8 digits, optionally split.
+    /// "OTP: 481920", "passcode 12 34 56", "koden är 481920". 4-8 digits,
+    /// optionally split. Cue words are anchored at a word start so
+    /// "postkod 11122" / "här 123456" don't cue, and "is"/"är" only act as
+    /// the connector after a noun, never as a cue on their own.
     private static let cuedCode = try! NSRegularExpression(
-        pattern: #"(?:code|otp|passcode|pass[\s-]?code|pin|password|is|:)\s*(?:is\s*)?[:#-]?\s*(\d[\d\s-]{2,10}\d)"#,
+        pattern: #"(?:\b(?:code|otp|passcode|pass[\s-]?code|pin|password|"# + swedishCodeNoun + #"|kod(?:en)?|lösenord)|:)\s*(?:(?:is|är)\s*)?[:#-]?\s*(\d[\d\s-]{2,10}\d)"#,
         options: [.caseInsensitive])
 
     private static let googleStyle = try! NSRegularExpression(pattern: #"\bG-(\d{4,8})\b"#)
 
     private static let standaloneDigits = try! NSRegularExpression(pattern: #"\b(\d{4,8})\b"#)
 
-    /// A duration near "expire"/"valid", e.g. "expires in 10 minutes".
-    private static let expiryDuration = try! NSRegularExpression(
-        pattern: #"\b(?:expir\w*|valid)\b[\s\S]{0,25}?\b(\d{1,3})\s*(second|sec|minute|min|hour|hr)s?\b"#,
-        options: [.caseInsensitive])
-
+    /// Every unit spelling the expiry regex can capture, in seconds. This is
+    /// the single source for the unit alternation below, so a unit can't be
+    /// matched by the regex yet missing from the lookup (or vice versa).
     private static let unitSeconds: [String: Int] = [
         "second": 1, "sec": 1, "minute": 60, "min": 60, "hour": 3600, "hr": 3600,
+        "sekund": 1, "sekunder": 1, "sekunderna": 1, "sek": 1,
+        "minut": 60, "minuter": 60, "minuterna": 60,
+        "timme": 3600, "timma": 3600, "timmar": 3600, "timmarna": 3600, "tim": 3600,
     ]
+
+    /// A duration near "expire"/"valid", e.g. "expires in 10 minutes",
+    /// "giltig i 10 minuter". Longest unit first so "minuter" wins over "min".
+    private static let expiryDuration: NSRegularExpression = {
+        let units = unitSeconds.keys.sorted { ($0.count, $0) > ($1.count, $1) }.joined(separator: "|")
+        return try! NSRegularExpression(
+            pattern: #"\b(?:expir\w*|valid|giltig\w*|gäller|går\s+ut|upphör\w*)\b[\s\S]{0,25}?\b(\d{1,3})\s*("# + units + #")s?\b"#,
+            options: [.caseInsensitive])
+    }()
 
     private static func isLikelyYear(_ digits: String) -> Bool {
         guard digits.count == 4, let n = Int(digits) else { return false }

@@ -124,8 +124,48 @@ public func stripHtml(_ html: String) -> String {
     for pattern in [#"<style[\s\S]*?</style>"#, #"<script[\s\S]*?</script>"#, #"<[^>]+>"#] {
         s = s.replacingOccurrences(of: pattern, with: " ", options: [.regularExpression, .caseInsensitive])
     }
-    s = s.replacingOccurrences(of: "&nbsp;", with: " ", options: .caseInsensitive)
-    s = s.replacingOccurrences(of: "&amp;", with: "&", options: .caseInsensitive)
+    s = decodeHtmlEntities(s)
     s = s.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
     return s.trimmingCharacters(in: .whitespaces)
+}
+
+private let htmlEntityPattern = try! NSRegularExpression(pattern: #"&(#x[0-9a-fA-F]{1,6}|#[0-9]{1,7}|[a-zA-Z][a-zA-Z0-9]{1,31});"#)
+
+/// Named entities beyond the XML five: the Latin-1 letters that appear in
+/// Swedish (and other Western European) mail. Numeric entities are decoded
+/// generically. Unknown names are left as-is.
+private let namedHtmlEntities: [String: String] = [
+    "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ",
+    "aring": "å", "Aring": "Å", "auml": "ä", "Auml": "Ä", "ouml": "ö", "Ouml": "Ö",
+    "aelig": "æ", "AElig": "Æ", "oslash": "ø", "Oslash": "Ø", "uuml": "ü", "Uuml": "Ü",
+    "eacute": "é", "Eacute": "É", "egrave": "è", "Egrave": "È", "ecirc": "ê",
+    "aacute": "á", "agrave": "à", "acirc": "â", "ccedil": "ç", "ntilde": "ñ",
+    "iacute": "í", "oacute": "ó", "uacute": "ú", "szlig": "ß",
+    "ndash": "–", "mdash": "—", "hellip": "…", "lsquo": "‘", "rsquo": "’",
+    "ldquo": "“", "rdquo": "”", "laquo": "«", "raquo": "»", "euro": "€", "copy": "©",
+]
+
+/// Decodes numeric (`&#229;`, `&#xE5;`) and common named (`&aring;`) HTML
+/// entities. A single pass, so `&amp;auml;` correctly yields the literal
+/// text "&auml;" rather than "ä".
+func decodeHtmlEntities(_ text: String) -> String {
+    let ns = text as NSString
+    var out = ""
+    var cursor = 0
+    for m in htmlEntityPattern.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+        out += ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor))
+        let body = ns.substring(with: m.range(at: 1))
+        let decoded: String?
+        if body.hasPrefix("#x") || body.hasPrefix("#X") {
+            decoded = UInt32(body.dropFirst(2), radix: 16).flatMap(Unicode.Scalar.init).map { String(Character($0)) }
+        } else if body.hasPrefix("#") {
+            decoded = UInt32(body.dropFirst()).flatMap(Unicode.Scalar.init).map { String(Character($0)) }
+        } else {
+            decoded = namedHtmlEntities[body]
+        }
+        out += decoded ?? ns.substring(with: m.range)
+        cursor = m.range.location + m.range.length
+    }
+    out += ns.substring(from: cursor)
+    return out
 }

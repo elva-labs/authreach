@@ -77,7 +77,12 @@ public actor OtpCenter {
                 runtime.processed.insert(entryId)
                 newest = max(newest, provider.watermark(for: message))
 
-                let text = [message.subject, message.snippet, message.text].joined(separator: " ")
+                // NFC so decomposed "a" + U+0308 still matches the precomposed
+                // "ä" in the detector's patterns (ICU regex has no canonical
+                // equivalence mode).
+                let text = [message.subject, message.snippet, message.text]
+                    .joined(separator: " ")
+                    .precomposedStringWithCanonicalMapping
                 guard let code = OtpDetector.detectCode(in: text) else { continue }
 
                 let expirySeconds = OtpDetector.detectExpirySeconds(in: text)
