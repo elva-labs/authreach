@@ -4,7 +4,7 @@ import KeyboardShortcuts
 import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem?
     private let model = AppModel()
     private var mainWindow: NSWindow?
@@ -112,6 +112,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Main window
 
+    /// The app is `.accessory` (no Dock icon, no ⌘-Tab entry) except while the
+    /// settings window is open. macOS never hands focus back to an accessory
+    /// app: when another app activates and then deactivates — menu bar
+    /// managers like Thaw/Ice do exactly that to hide application menus while
+    /// items are revealed — the next regular app wins and this window ends up
+    /// buried with no way to reach it. As a regular app AuthReach is the one
+    /// that gets reactivated, and the window is a ⌘-Tab away regardless.
     @objc func openMain() {
         if mainWindow == nil {
             let window = NSWindow(contentRect: .zero,
@@ -120,12 +127,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.title = "AuthReach"
             window.contentViewController = NSHostingController(rootView: MainView(model: model))
             window.isReleasedWhenClosed = false
+            window.delegate = self
             window.setContentSize(NSSize(width: 520, height: 620))
             window.center()
             mainWindow = window
         }
+        NSApp.setActivationPolicy(.regular)
         mainWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === mainWindow else { return }
+        NSApp.setActivationPolicy(.accessory)
     }
 
     private func buildMainMenu() {
@@ -137,6 +151,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appMenu.addItem(withTitle: "Quit AuthReach", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
+
+        let fileMenuItem = NSMenuItem()
+        let fileMenu = NSMenu(title: "File")
+        fileMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileMenuItem.submenu = fileMenu
+        mainMenu.addItem(fileMenuItem)
 
         let editMenuItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
