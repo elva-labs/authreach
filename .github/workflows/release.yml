@@ -50,10 +50,20 @@ jobs:
       - name: Build and sign
         env:
           BUILD_NUMBER: ${{ github.run_number }}
+          AUTHREACH_ARCHS: arm64 x86_64
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           VERSION="$VERSION" scripts/make-app.sh
+
+      # Checked here rather than trusting AUTHREACH_ARCHS: an arm64-only
+      # release would pass every later step and still not launch on Intel.
+      - name: Verify universal binary
+        run: |
+          for arch in arm64 x86_64; do
+            lipo "build/AuthReach.app/Contents/MacOS/AuthReach" -verify_arch "$arch" \
+              || { echo "Release binary is missing the $arch slice"; exit 1; }
+          done
 
       - name: Notarize and staple
         env:

@@ -1,9 +1,12 @@
 #!/bin/sh
 # Assembles "AuthReach.app" from the SwiftPM release build.
 # Usage: scripts/make-app.sh [output-dir]        (default: ./build)
-# Env: SIGN_IDENTITY, VERSION, BUILD_NUMBER,
-#      ARCHS (default "arm64 x86_64": a universal binary for Apple silicon
-#      and Intel Macs; set ARCHS=arm64 for a faster local build)
+# Env: SIGN_IDENTITY, VERSION, BUILD_NUMBER, AUTHREACH_ARCHS
+#
+# AUTHREACH_ARCHS lists the architectures to build, default this Mac's own
+# (one release build, for a fast local loop). Releases set "arm64 x86_64" for
+# a universal binary. The name is namespaced because Xcode build phases and
+# other tooling export a plain ARCHS that would silently thin the build.
 #
 # SIGN_IDENTITY defaults to the first "Developer ID Application" identity in
 # the login keychain, else "-" (ad-hoc). A Developer ID build is the same
@@ -20,7 +23,7 @@ if [ -z "${SIGN_IDENTITY:-}" ]; then
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
   SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 fi
-ARCHS="${ARCHS:-arm64 x86_64}"
+ARCHS="${AUTHREACH_ARCHS:-$(uname -m)}"
 
 if [ -z "${DEVELOPER_DIR:-}" ] \
   && ! xcode-select -p | grep -q "Xcode.app" \

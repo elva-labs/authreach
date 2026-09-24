@@ -24,7 +24,7 @@ cd authreach
 make app && make run
 ```
 
-`make app` builds a universal binary. Set `ARCHS=arm64` (or `x86_64`) to build only for your own Mac, which is faster.
+`make app` builds for your own Mac's architecture. For a universal binary, run `make app AUTHREACH_ARCHS="arm64 x86_64"`.
 
 A notarized release and Homebrew cask (`elva-labs/elva`) are on the way.
 

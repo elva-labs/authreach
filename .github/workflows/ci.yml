@@ -23,6 +23,10 @@ jobs:
         run: swift build
       - name: Test
         run: swift test
+      # Cross-compiles the x86_64 slice, so one runner covers both; ARM64 is
+      # the runner that stays when the Intel image is retired.
       - name: Assemble universal app bundle
-        if: matrix.os == 'macos-15'
+        if: runner.arch == 'ARM64'
+        env:
+          AUTHREACH_ARCHS: arm64 x86_64
         run: scripts/make-app.sh
