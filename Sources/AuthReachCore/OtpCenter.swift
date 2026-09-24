@@ -15,15 +15,24 @@ public actor OtpCenter {
 
     public static let maxRecent = 20
 
-    private let provider: any InboxProvider
+    /// Picks the inbox provider for an account (Gmail vs IMAP).
+    public typealias ProviderResolver = @Sendable (ConnectedAccount) -> any InboxProvider
+
+    private let providerFor: ProviderResolver
+    private var providers: [String: any InboxProvider] = [:]
     private var runtimes: [String: AccountRuntime] = [:]
     public private(set) var recent: [OtpEntry] = []
 
     /// Called for each genuinely new code, oldest first.
     private var onNewCode: (@Sendable (OtpEntry) -> Void)?
 
+    public init(providerFor: @escaping ProviderResolver) {
+        self.providerFor = providerFor
+    }
+
+    /// Single-provider convenience (tests, or a Gmail-only setup).
     public init(provider: any InboxProvider) {
-        self.provider = provider
+        self.init(providerFor: { _ in provider })
     }
 
     public func setOnNewCode(_ handler: @escaping @Sendable (OtpEntry) -> Void) {
@@ -32,11 +41,14 @@ public actor OtpCenter {
 
     public func configureAccounts(_ accounts: [ConnectedAccount]) {
         var next: [String: AccountRuntime] = [:]
+        var nextProviders: [String: any InboxProvider] = [:]
         for account in accounts {
             next[account.id] = runtimes[account.id] ?? AccountRuntime(email: account.email)
             next[account.id]?.email = account.email
+            nextProviders[account.id] = providerFor(account)
         }
         runtimes = next
+        providers = nextProviders
     }
 
     public func runtime(accountId: String) -> AccountRuntime? {
@@ -56,7 +68,7 @@ public actor OtpCenter {
     }
 
     private func poll(accountId: String) async {
-        guard var runtime = runtimes[accountId] else { return }
+        guard var runtime = runtimes[accountId], let provider = providers[accountId] else { return }
         defer {
             runtime.lastCheckedAt = Date()
             runtimes[accountId] = runtime
@@ -104,6 +116,12 @@ public actor OtpCenter {
             // Keep the processed set bounded; ids older than the watermark
             // can never be listed again.
             if runtime.processed.count > 500 { runtime.processed = [] }
+        } catch InboxProviderError.baselineReset {
+            // Ids were renumbered under us; start over from a fresh baseline
+            // next tick rather than trusting the old watermark.
+            runtime.watermark = nil
+            runtime.processed = []
+            runtime.lastError = nil
         } catch {
             runtime.lastError = error.localizedDescription
         }
