@@ -49,6 +49,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 menu.addItem(item)
             }
         }
+        // A broken account otherwise fails silently until someone opens
+        // Settings, and its codes just stop arriving.
+        let failing = model.settings.accounts.filter { !(model.accountStatus[$0.id] ?? "").isEmpty }
+        if !failing.isEmpty {
+            menu.addItem(.separator())
+            let title = failing.count == 1
+                ? "\(failing[0].email) needs attention…"
+                : "\(failing.count) accounts need attention…"
+            let item = NSMenuItem(title: title, action: #selector(openMain), keyEquivalent: "")
+            item.target = self
+            item.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: "Warning")
+            item.toolTip = failing.map { "\($0.email): \(model.accountStatus[$0.id] ?? "")" }.joined(separator: "\n")
+            menu.addItem(item)
+        }
         menu.addItem(.separator())
         menu.addItem({ let i = NSMenuItem(title: "Settings…", action: #selector(openMain), keyEquivalent: ""); i.target = self; return i }())
         menu.addItem({ let i = NSMenuItem(title: "Check now", action: #selector(checkNow), keyEquivalent: ""); i.target = self; return i }())

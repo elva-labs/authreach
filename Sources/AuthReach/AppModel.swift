@@ -3,6 +3,15 @@ import AuthReachCore
 import Foundation
 import UserNotifications
 
+/// A message at the bottom of the settings window. Errors stay until
+/// dismissed or replaced, so a failure is still there when the user comes
+/// back from the browser; anything else clears itself.
+struct Notice: Equatable, Identifiable {
+    let id = UUID()
+    let text: String
+    let isError: Bool
+}
+
 /// Composition root: settings + keychain + OAuth + Gmail + IMAP + poll
 /// loop + local API, published for SwiftUI and the tray.
 @MainActor
@@ -10,6 +19,7 @@ final class AppModel: ObservableObject {
     let settingsStore = SettingsStore.standard()
     let keychain = KeychainStore()
     let oauth: GoogleOAuth
+    let gmail: GmailClient
     let imap: ImapProvider
     let center: OtpCenter
     private var apiServer: LocalApiServer?
@@ -19,7 +29,9 @@ final class AppModel: ObservableObject {
     @Published var recent: [OtpEntry] = []
     @Published var accountStatus: [String: String] = [:] // accountId -> error or ""
     @Published var googleCredentialsSet: Bool
-    @Published var notice: String?
+    @Published var notice: Notice?
+    @Published private(set) var googleSignInPending = false
+    private var googleSignInTask: Task<Void, Never>?
     @Published var localApiError: String?
 
     /// Fires whenever recent codes change, so the tray can refresh.
@@ -43,6 +55,7 @@ final class AppModel: ObservableObject {
         let gmail = GmailClient(tokenProvider: { accountId in
             try await oauth.accessToken(accountId: accountId)
         })
+        self.gmail = gmail
         let imap = ImapProvider(credentialsProvider: { accountId in
             keychain.get(ImapCredentials.self, forKey: Self.imapKey(accountId))
         })
@@ -96,6 +109,12 @@ final class AppModel: ObservableObject {
         Task { recent = await center.recent; onRecentChanged?() }
     }
 
+    // MARK: - Notices
+
+    func inform(_ text: String) { notice = Notice(text: text, isError: false) }
+    func report(_ text: String) { notice = Notice(text: text, isError: true) }
+    func report(_ error: Error) { report(error.localizedDescription) }
+
     // MARK: - Actions
 
     func copy(_ text: String) {
@@ -105,47 +124,71 @@ final class AppModel: ObservableObject {
 
     func copyEntry(_ entry: OtpEntry) {
         copy(entry.code)
-        notice = "Copied \(entry.code) (\(entry.service))"
+        inform("Copied \(entry.code) (\(entry.service))")
     }
 
-    func saveGoogleCredentials(clientId: String, clientSecret: String) {
+    func saveGoogleCredentials(_ credentials: GoogleCredentials) {
         do {
-            try keychain.set(GoogleCredentials(clientId: clientId.trimmingCharacters(in: .whitespaces),
-                                               clientSecret: clientSecret.trimmingCharacters(in: .whitespaces)),
-                             forKey: Self.credentialsKey)
+            try keychain.set(credentials, forKey: Self.credentialsKey)
             googleCredentialsSet = true
-            notice = "Google credentials saved"
+            inform("Google credentials saved")
         } catch {
-            notice = error.localizedDescription
+            report(error)
         }
     }
 
+    /// Starts the browser sign-in. Adding an address that is already
+    /// connected renews that account's sign-in instead of duplicating it,
+    /// which is also how an expired or revoked sign-in is fixed.
     func addGoogleAccount() {
         guard googleCredentialsSet else {
-            notice = "Add your Google API credentials first."
+            report("Add your Google API credentials first.")
             return
         }
+        guard googleSignInTask == nil else { return }
         let accountId = UUID().uuidString
-        Task {
+        googleSignInPending = true
+        googleSignInTask = Task {
+            defer {
+                googleSignInTask = nil
+                googleSignInPending = false
+            }
             do {
-                try await oauth.authorize(accountId: accountId) { url in
+                try await oauth.authorize(accountId: accountId, openURL: { url in
                     Task { @MainActor in NSWorkspace.shared.open(url) }
-                }
-                let gmail = GmailClient(tokenProvider: { [oauth] id in
-                    try await oauth.accessToken(accountId: id)
+                }, complete: {
+                    try await self.finishGoogleSignIn(accountId: accountId)
                 })
-                let email = try await gmail.profileEmail(accountId: accountId)
-                settings = try settingsStore.update { s in
-                    s.accounts.append(ConnectedAccount(id: accountId, email: email))
-                }
-                await center.configureAccounts(settings.accounts)
-                notice = "Connected \(email)"
                 await pollNow()
             } catch {
                 oauth.signOut(accountId: accountId)
-                notice = error.localizedDescription
+                if !(error is CancellationError) { report(error) }
             }
         }
+    }
+
+    func cancelGoogleSignIn() {
+        googleSignInTask?.cancel()
+    }
+
+    /// Runs while the browser waits on the redirect, so its page can say
+    /// whether the account was really connected. Returns the address.
+    private func finishGoogleSignIn(accountId: String) async throws -> String {
+        let email = try await gmail.profileEmail(accountId: accountId)
+        try Task.checkCancellation()
+        if let existing = settings.accounts.first(where: {
+            $0.provider == .google && $0.email.caseInsensitiveCompare(email) == .orderedSame
+        }) {
+            try oauth.moveTokens(from: accountId, to: existing.id)
+            inform("Reconnected \(email)")
+        } else {
+            settings = try settingsStore.update { s in
+                s.accounts.append(ConnectedAccount(id: accountId, email: email))
+            }
+            await center.configureAccounts(settings.accounts)
+            inform("Connected \(email)")
+        }
+        return email
     }
 
     /// Verifies the credentials against the server (sign-in + read-only
@@ -161,7 +204,7 @@ final class AppModel: ObservableObject {
             s.accounts.append(ConnectedAccount(id: accountId, email: email, provider: .imap))
         }
         await center.configureAccounts(settings.accounts)
-        notice = "Connected \(email)"
+        inform("Connected \(email)")
         await pollNow()
     }
 
@@ -176,7 +219,7 @@ final class AppModel: ObservableObject {
             settings = try settingsStore.update { s in
                 s.accounts.removeAll { $0.id == account.id }
             }
-        } catch { notice = error.localizedDescription }
+        } catch { report(error) }
         Task { await center.configureAccounts(settings.accounts); await pollNow() }
     }
 
@@ -188,7 +231,7 @@ final class AppModel: ObservableObject {
             if settings.notify && !old.notify { Self.requestNotificationPermission() }
             if settings.localApiEnabled != old.localApiEnabled
                 || settings.localApiPort != old.localApiPort { syncLocalApi() }
-        } catch { notice = error.localizedDescription }
+        } catch { report(error) }
     }
 
     // MARK: - Local API
@@ -217,7 +260,7 @@ final class AppModel: ObservableObject {
 
     func regenerateApiToken() {
         updateSettings { $0.localApiToken = LocalApiServer.generateToken() }
-        notice = "API token regenerated"
+        inform("API token regenerated")
     }
 
     // MARK: - Notifications
