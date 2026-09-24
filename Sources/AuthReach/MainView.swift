@@ -25,15 +25,13 @@ struct MainView: View {
         }
         .overlay(alignment: .bottom) {
             if let notice = model.notice {
-                Text(notice)
-                    .font(.caption).lineLimit(2)
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
-                    .padding(.bottom, 12)
-                    .task {
+                NoticeBanner(notice: notice) { model.notice = nil }
+                    .padding(.horizontal, 16).padding(.bottom, 12)
+                    // Keyed by id, so a newer notice gets its own full delay.
+                    .task(id: notice.id) {
+                        guard !notice.isError else { return }
                         try? await Task.sleep(nanoseconds: 4_000_000_000)
-                        model.notice = nil
+                        if model.notice?.id == notice.id { model.notice = nil }
                     }
             }
         }
@@ -51,10 +49,18 @@ struct MainView: View {
                     Text(account.provider == .google ? "Gmail" : "IMAP")
                         .font(.caption2).foregroundStyle(.tertiary)
                     Spacer()
-                    if let error = model.accountStatus[account.id], !error.isEmpty {
-                        Text(error).font(.caption).foregroundStyle(.red)
-                            .lineLimit(1).truncationMode(.tail)
-                            .help(error)
+                    if let problem = model.accountStatus[account.id] {
+                        // Problems that clear up on their own aren't shown as errors.
+                        Text(problem.message).font(.caption)
+                            .foregroundStyle(problem.needsAttention ? Color.red : Color.secondary)
+                            .lineLimit(2).truncationMode(.tail)
+                            .help(problem.message)
+                        if account.provider == .google, problem.remedy == .reconnect {
+                            Button("Reconnect") { model.addGoogleAccount(reconnecting: account) }
+                                .controlSize(.small)
+                                .disabled(model.googleSignInPending)
+                                .help("Sign in to \(account.email) again in your browser")
+                        }
                     } else {
                         Text("OK").font(.caption).foregroundStyle(.green)
                     }
@@ -65,9 +71,18 @@ struct MainView: View {
                         .accessibilityLabel("Disconnect \(account.email)")
                 }
             }
+            if model.googleSignInPending {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for Google sign-in in your browser…")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel") { model.cancelGoogleSignIn() }.controlSize(.small)
+                }
+            }
             HStack {
                 Button("Add Google account…") { model.addGoogleAccount() }
-                    .disabled(!model.googleCredentialsSet)
+                    .disabled(!model.googleCredentialsSet || model.googleSignInPending)
                 Button("Add IMAP account…") { showImapSheet = true }
                 Spacer()
                 Button(model.googleCredentialsSet ? "Google API credentials…" : "Set up Google API credentials…") {
@@ -139,7 +154,7 @@ struct MainView: View {
                     Text(model.settings.localApiToken.isEmpty ? "token pending…" : model.settings.localApiToken)
                         .font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
                         .foregroundStyle(.secondary)
-                    Button { model.copy(model.settings.localApiToken); model.notice = "Token copied" }
+                    Button { model.copy(model.settings.localApiToken); model.inform("Token copied") }
                         label: { Image(systemName: "doc.on.doc") }
                         .buttonStyle(.borderless).accessibilityLabel("Copy token")
                     Button { model.regenerateApiToken() }
@@ -173,6 +188,10 @@ struct CredentialsSheet: View {
     @State private var clientId = ""
     @State private var clientSecret = ""
 
+    private var credentials: GoogleCredentials {
+        GoogleCredentials(pastedClientId: clientId, clientSecret: clientSecret)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Google API credentials").font(.headline)
@@ -183,6 +202,11 @@ struct CredentialsSheet: View {
                 .textFieldStyle(.roundedBorder).font(.caption.monospaced())
             SecureField("Client secret", text: $clientSecret)
                 .textFieldStyle(.roundedBorder).font(.caption.monospaced())
+            // Only once both are filled in, so it doesn't nag while typing.
+            if !clientId.isEmpty, !clientSecret.isEmpty, let problem = credentials.problem {
+                Text(problem).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack {
                 Link("Open Google Cloud console",
                      destination: URL(string: "https://console.cloud.google.com/apis/credentials")!)
@@ -190,11 +214,11 @@ struct CredentialsSheet: View {
                 Spacer()
                 Button("Cancel") { isPresented = false }.keyboardShortcut(.cancelAction)
                 Button("Save") {
-                    model.saveGoogleCredentials(clientId: clientId, clientSecret: clientSecret)
+                    model.saveGoogleCredentials(credentials)
                     isPresented = false
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(clientId.isEmpty || clientSecret.isEmpty)
+                .disabled(credentials.problem != nil)
             }
         }
         .padding(16)
@@ -202,6 +226,33 @@ struct CredentialsSheet: View {
     }
 }
 
+/// The bottom-of-window notice. Errors get an icon, wrap instead of
+/// truncating, can be selected (to paste into a search or a bug report),
+/// and have a close button since they don't time out.
+struct NoticeBanner: View {
+    let notice: Notice
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            if notice.isError {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+            }
+            Text(notice.text)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            if notice.isError {
+                Button(action: dismiss) { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless).font(.caption)
+                    .accessibilityLabel("Dismiss")
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(notice.isError ? AnyShapeStyle(.red.opacity(0.5)) : AnyShapeStyle(.quaternary)))
+    }
+}
 
 /// Generic IMAP account: host/port/username/password, verified against the
 /// server before being stored in the Keychain.

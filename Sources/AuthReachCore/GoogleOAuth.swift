@@ -16,10 +16,13 @@ public struct OAuthTokens: Codable, Sendable {
 
 public final class GoogleOAuth: @unchecked Sendable {
     public static let scope = "https://www.googleapis.com/auth/gmail.readonly"
-    private let keychain: KeychainStore
+    private let keychain: any SecretStore
     private let credentialsProvider: @Sendable () -> GoogleCredentials?
+    /// Serialises read-modify-write of stored tokens, so a refresh that was
+    /// in flight during a reconnect can't overwrite the new sign-in.
+    private let tokenLock = NSLock()
 
-    public init(keychain: KeychainStore = KeychainStore(),
+    public init(keychain: any SecretStore = KeychainStore(),
                 credentialsProvider: @escaping @Sendable () -> GoogleCredentials?) {
         self.keychain = keychain
         self.credentialsProvider = credentialsProvider
@@ -28,15 +31,35 @@ public final class GoogleOAuth: @unchecked Sendable {
     public enum OAuthError: LocalizedError {
         case noCredentials
         case notConnected
+        case consentDeclined
+        case timedOut
+        /// Reconnect signed in to a different Google account than the one
+        /// being reconnected.
+        case wrongAccount(expected: String, actual: String)
         case flowFailed(String)
         public var errorDescription: String? {
             switch self {
             case .noCredentials: return "Add your Google API credentials before connecting."
-            case .notConnected: return "Not connected to Gmail. Please reconnect this account."
+            case .notConnected: return "Not signed in to Google. Choose Reconnect."
+            case .consentDeclined: return "Sign-in was cancelled on Google's consent screen."
+            case .timedOut:
+                return "Timed out waiting for Google sign-in. If Google showed an error page instead, check that your OAuth client is a Desktop app and that this Google account is a test user (or the app is published)."
+            case .wrongAccount(let expected, let actual):
+                return "You signed in as \(actual), not \(expected). Choose Reconnect again and pick \(expected) in Google's account chooser."
             case .flowFailed(let reason): return "Google sign-in failed: \(reason)"
             }
         }
+
+        public var remedy: AccountProblem.Remedy {
+            switch self {
+            case .notConnected: return .reconnect
+            case .noCredentials, .consentDeclined, .timedOut, .wrongAccount, .flowFailed: return .manual
+            }
+        }
     }
+
+    /// How long the browser flow may take before the listener gives up.
+    static let consentTimeout: TimeInterval = 300
 
     private func tokenKey(_ accountId: String) -> String { "google-tokens:\(accountId)" }
 
@@ -48,20 +71,80 @@ public final class GoogleOAuth: @unchecked Sendable {
         keychain.remove(forKey: tokenKey(accountId))
     }
 
+    /// Moves an account's tokens to another id, replacing any there; used
+    /// when a sign-in turns out to be an account that is already connected.
+    /// `async` so the Keychain access (which can block on a prompt) runs off
+    /// the caller's actor.
+    public func moveTokens(from source: String, to destination: String) async throws {
+        try withTokenLock {
+            guard let tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(source)) else {
+                throw OAuthError.notConnected
+            }
+            try keychain.set(tokens, forKey: tokenKey(destination))
+            keychain.remove(forKey: tokenKey(source))
+        }
+    }
+
+    private func withTokenLock<T>(_ body: () throws -> T) rethrows -> T {
+        tokenLock.lock()
+        defer { tokenLock.unlock() }
+        return try body()
+    }
+
     // MARK: - Browser flow
 
-    /// Runs the full flow: starts a one-shot loopback listener, opens the
-    /// consent URL (via `openURL`), waits for the redirect, exchanges the
-    /// code, and stores tokens for `accountId`.
-    public func authorize(accountId: String, openURL: @escaping @Sendable (URL) -> Void) async throws {
+    /// Runs the full flow: starts a loopback listener, opens the consent URL
+    /// (via `openURL`), waits for the redirect, exchanges the code and
+    /// stores tokens for `accountId`. `loginHint` preselects that address in
+    /// Google's account chooser. `complete` then finishes connecting the
+    /// account and returns what to name it in the browser (its address);
+    /// the redirect request is only answered after that, so the browser page
+    /// reports the real outcome. Throws `CancellationError` if the calling
+    /// task is cancelled while waiting.
+    @discardableResult
+    public func authorize(accountId: String,
+                          loginHint: String? = nil,
+                          openURL: @escaping @Sendable (URL) -> Void,
+                          complete: @Sendable () async throws -> String) async throws -> String {
         guard let credentials = credentialsProvider() else { throw OAuthError.noCredentials }
 
-        let (port, codeTask) = try startLoopbackListener()
-        let redirectUri = "http://127.0.0.1:\(port)/callback"
+        let server = try LoopbackRedirectServer.start()
+        let redirectUri = "http://127.0.0.1:\(server.port)/callback"
 
+        openURL(Self.consentURL(clientId: credentials.clientId, redirectUri: redirectUri, loginHint: loginHint))
+
+        let query = try await server.waitForCallback(timeout: Self.consentTimeout)
+        do {
+            let code = try Self.authorizationCode(from: query)
+            let tokens = try await exchange(credentials: credentials, refreshing: false, body: [
+                "code": code,
+                "client_id": credentials.clientId,
+                "client_secret": credentials.clientSecret,
+                "redirect_uri": redirectUri,
+                "grant_type": "authorization_code",
+            ])
+            try keychain.set(tokens, forKey: tokenKey(accountId))
+            let name = try await complete()
+            server.finish(LoopbackRedirectServer.page(
+                title: "Connected \(name)",
+                message: "You can close this window and return to AuthReach."))
+            return name
+        } catch {
+            // Cancelling mid-exchange surfaces as URLError.cancelled; report
+            // it as the cancellation it is, not as a failure.
+            let cancelled = Task.isCancelled || error is CancellationError
+            server.finish(LoopbackRedirectServer.page(
+                title: "Couldn't connect",
+                message: cancelled ? "Sign-in was cancelled in AuthReach." : error.localizedDescription,
+                isError: true))
+            throw cancelled ? CancellationError() : error
+        }
+    }
+
+    static func consentURL(clientId: String, redirectUri: String, loginHint: String?) -> URL {
         var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
         components.queryItems = [
-            URLQueryItem(name: "client_id", value: credentials.clientId),
+            URLQueryItem(name: "client_id", value: clientId),
             URLQueryItem(name: "redirect_uri", value: redirectUri),
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "scope", value: Self.scope),
@@ -69,38 +152,59 @@ public final class GoogleOAuth: @unchecked Sendable {
             // Force the consent screen so Google re-issues a refresh token.
             URLQueryItem(name: "prompt", value: "consent"),
         ]
-        openURL(components.url!)
+        if let loginHint {
+            components.queryItems?.append(URLQueryItem(name: "login_hint", value: loginHint))
+        }
+        return components.url!
+    }
 
-        let code = try await codeTask.value
-        let tokens = try await exchange(credentials: credentials, body: [
-            "code": code,
-            "client_id": credentials.clientId,
-            "client_secret": credentials.clientSecret,
-            "redirect_uri": redirectUri,
-            "grant_type": "authorization_code",
-        ])
-        try keychain.set(tokens, forKey: tokenKey(accountId))
+    /// The `code` of a redirect, or the error Google redirected with
+    /// instead (RFC 6749 §4.1.2.1): `access_denied` when the user declines.
+    static func authorizationCode(from query: [String: String]) throws -> String {
+        if let error = query["error"] {
+            if error == "access_denied" { throw OAuthError.consentDeclined }
+            throw OAuthError.flowFailed(error)
+        }
+        guard let code = query["code"], !code.isEmpty else {
+            throw OAuthError.flowFailed("Google returned no authorization code")
+        }
+        return code
     }
 
     /// A live access token for the account, refreshing if stale.
     public func accessToken(accountId: String) async throws -> String {
-        guard var tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(accountId)) else {
+        guard let tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(accountId)) else {
             throw OAuthError.notConnected
         }
         if tokens.isFresh { return tokens.accessToken }
         guard let credentials = credentialsProvider() else { throw OAuthError.noCredentials }
         guard let refreshToken = tokens.refreshToken else { throw OAuthError.notConnected }
-        let refreshed = try await exchange(credentials: credentials, body: [
+        let refreshed = try await exchange(credentials: credentials, refreshing: true, body: [
             "refresh_token": refreshToken,
             "client_id": credentials.clientId,
             "client_secret": credentials.clientSecret,
             "grant_type": "refresh_token",
         ])
-        tokens.accessToken = refreshed.accessToken
-        tokens.expiresAt = refreshed.expiresAt
-        if let newRefresh = refreshed.refreshToken { tokens.refreshToken = newRefresh }
-        try keychain.set(tokens, forKey: tokenKey(accountId))
-        return tokens.accessToken
+        guard try commitRefresh(refreshed, accountId: accountId, refreshedWith: refreshToken) else {
+            // A sign-in replaced (or removed) the tokens while this refresh
+            // was in flight; use whatever is stored now.
+            return try await accessToken(accountId: accountId)
+        }
+        return refreshed.accessToken
+    }
+
+    /// Stores a refresh result, unless the account's tokens no longer hold
+    /// the refresh token it was made with. Returns whether it stored.
+    func commitRefresh(_ refreshed: OAuthTokens, accountId: String, refreshedWith refreshToken: String) throws -> Bool {
+        try withTokenLock {
+            guard var tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(accountId)),
+                  tokens.refreshToken == refreshToken else { return false }
+            tokens.accessToken = refreshed.accessToken
+            tokens.expiresAt = refreshed.expiresAt
+            if let newRefresh = refreshed.refreshToken { tokens.refreshToken = newRefresh }
+            try keychain.set(tokens, forKey: tokenKey(accountId))
+            return true
+        }
     }
 
     // MARK: - Token endpoint
@@ -109,9 +213,11 @@ public final class GoogleOAuth: @unchecked Sendable {
         let access_token: String
         let refresh_token: String?
         let expires_in: Double?
+        let scope: String?
     }
 
-    private func exchange(credentials: GoogleCredentials, body: [String: String]) async throws -> OAuthTokens {
+    private func exchange(credentials: GoogleCredentials, refreshing: Bool,
+                          body: [String: String]) async throws -> OAuthTokens {
         var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -120,123 +226,26 @@ public final class GoogleOAuth: @unchecked Sendable {
         }.joined(separator: "&").data(using: .utf8)
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let detail = String(data: data, encoding: .utf8) ?? ""
-            throw OAuthError.flowFailed("token endpoint: \(detail.prefix(200))")
+        guard let http = response as? HTTPURLResponse else {
+            throw OAuthError.flowFailed("unexpected response from the token endpoint")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw GoogleAPIError.fromTokenEndpoint(status: http.statusCode, body: data, refreshing: refreshing)
         }
         let parsed = try JSONDecoder().decode(TokenResponse.self, from: data)
+        if !Self.grantsGmail(scope: parsed.scope) { throw GoogleAPIError.scopeNotGranted }
         return OAuthTokens(accessToken: parsed.access_token,
                            refreshToken: parsed.refresh_token,
                            expiresAt: Date().timeIntervalSince1970 + (parsed.expires_in ?? 3600))
     }
 
-    // MARK: - Loopback listener
-
-    /// One-shot HTTP listener bound to an explicit high port on loopback;
-    /// resolves with the `code` query parameter of the first /callback
-    /// request. The port is chosen before building the redirect URI, and the
-    /// browser is only opened once the listener reports ready — never a
-    /// ":0" redirect.
-    private func startLoopbackListener() throws -> (UInt16, Task<String, Error>) {
-        var lastError: Error = OAuthError.flowFailed("could not open loopback listener")
-        for _ in 0..<10 {
-            let port = UInt16.random(in: 49152...65500)
-            do {
-                return (port, try listen(on: port))
-            } catch {
-                lastError = error
-            }
-        }
-        throw lastError
-    }
-
-    private func listen(on port: UInt16) throws -> Task<String, Error> {
-        let parameters = NWParameters.tcp
-        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
-            host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
-        let listener = try NWListener(using: parameters)
-
-        // Wait for ready/failed before returning, so a port collision is
-        // retried instead of sending the browser to a dead port.
-        let readySemaphore = DispatchSemaphore(value: 0)
-        let readyState = LockedBox<NWListener.State>(.setup)
-        listener.stateUpdateHandler = { state in
-            switch state {
-            case .ready, .failed, .cancelled:
-                readyState.set(state)
-                readySemaphore.signal()
-            default:
-                break
-            }
-        }
-
-        let resumed = ResumeGuard()
-        let task = Task<String, Error> {
-            try await withCheckedThrowingContinuation { continuation in
-                listener.newConnectionHandler = { connection in
-                    connection.start(queue: .global())
-                    connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, _ in
-                        let request = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                        let firstLine = request.split(separator: "\r\n").first ?? ""
-                        // Ignore stray probes (favicon etc.) that aren't the callback.
-                        guard firstLine.contains("/callback") else {
-                            connection.cancel()
-                            return
-                        }
-                        let result: Result<String, Error>
-                        let page: String
-                        if let range = firstLine.range(of: #"code=([^&\s]+)"#, options: .regularExpression) {
-                            let code = String(firstLine[range].dropFirst("code=".count))
-                                .removingPercentEncoding ?? ""
-                            result = .success(code)
-                            page = "<html><body style=\"font-family:sans-serif\"><h3>Connected.</h3>You can close this window and return to AuthReach.</body></html>"
-                        } else {
-                            result = .failure(OAuthError.flowFailed("consent was denied or no code returned"))
-                            page = "<html><body style=\"font-family:sans-serif\"><h3>Sign-in failed.</h3>You can close this window.</body></html>"
-                        }
-                        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: \(page.utf8.count)\r\n\r\n\(page)"
-                        connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
-                            connection.cancel()
-                            listener.cancel()
-                            if resumed.claim() { continuation.resume(with: result) }
-                        })
-                    }
-                }
-                listener.start(queue: .global())
-            }
-        }
-
-        if readySemaphore.wait(timeout: .now() + 3) == .timedOut {
-            listener.cancel()
-            task.cancel()
-            throw OAuthError.flowFailed("loopback listener timed out while starting")
-        }
-        guard case .ready = readyState.get() else {
-            listener.cancel()
-            task.cancel()
-            throw OAuthError.flowFailed("loopback port \(port) unavailable")
-        }
-        return task
-    }
-}
-
-private final class LockedBox<T>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: T
-    init(_ value: T) { self.value = value }
-    func set(_ new: T) { lock.lock(); value = new; lock.unlock() }
-    func get() -> T { lock.lock(); defer { lock.unlock() }; return value }
-}
-
-/// Ensures a continuation resumes exactly once even if multiple connections
-/// race (browsers often probe with a favicon request).
-private final class ResumeGuard: @unchecked Sendable {
-    private let lock = NSLock()
-    private var used = false
-    func claim() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if used { return false }
-        used = true
-        return true
+    /// Whether a token response's space-separated `scope` includes Gmail
+    /// read access. Google lets the user untick scopes on the consent
+    /// screen (granular consent), and says so here rather than failing;
+    /// an absent `scope` means the requested scopes were granted
+    /// (RFC 6749 §5.1).
+    static func grantsGmail(scope: String?) -> Bool {
+        guard let scope else { return true }
+        return scope.split(separator: " ").contains { $0 == Self.scope }
     }
 }

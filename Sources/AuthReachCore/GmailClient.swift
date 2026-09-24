@@ -16,14 +16,8 @@ public struct GmailClient: InboxProvider {
     }
 
     public enum GmailError: LocalizedError {
-        case api(status: Int, body: String)
         case badResponse
-        public var errorDescription: String? {
-            switch self {
-            case .api(let status, let body): return "Gmail API error \(status): \(body.prefix(300))"
-            case .badResponse: return "Unexpected Gmail API response."
-            }
-        }
+        public var errorDescription: String? { "Unexpected Gmail API response." }
     }
 
     func fetch<T: Decodable>(_ type: T.Type, accountId: String, pathAndQuery: String) async throws -> T {
@@ -33,7 +27,7 @@ public struct GmailClient: InboxProvider {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw GmailError.badResponse }
         guard (200..<300).contains(http.statusCode) else {
-            throw GmailError.api(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+            throw GoogleAPIError.fromGmail(status: http.statusCode, body: data)
         }
         return try JSONDecoder().decode(T.self, from: data)
     }

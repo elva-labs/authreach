@@ -1,10 +1,17 @@
 import Foundation
 import Security
 
+/// Where secrets are kept: the Keychain in the app, memory in tests.
+public protocol SecretStore: Sendable {
+    func set<T: Encodable>(_ value: T, forKey key: String) throws
+    func get<T: Decodable>(_ type: T.Type, forKey key: String) -> T?
+    func remove(forKey key: String)
+}
+
 /// Codable values in the login keychain — the native replacement for the
 /// Electron app's safeStorage-encrypted files. Google OAuth client
 /// credentials and per-account tokens all live here.
-public struct KeychainStore: Sendable {
+public struct KeychainStore: SecretStore {
     public let service: String
 
     public init(service: String = "com.elva-labs.authreach") {

@@ -87,6 +87,22 @@ public struct Settings: Codable, Sendable {
     }
 }
 
+extension Settings {
+    /// The connected Google account a finished sign-in as `email` renews,
+    /// or nil when it's a new one. Addresses compare case-insensitively.
+    /// When reconnecting a specific account, signing in as any other
+    /// address throws `OAuthError.wrongAccount` rather than quietly adding
+    /// a second account and leaving the broken one broken.
+    public func googleAccount(signedInAs email: String,
+                              reconnecting expected: ConnectedAccount?) throws -> ConnectedAccount? {
+        func same(_ a: String, _ b: String) -> Bool { a.caseInsensitiveCompare(b) == .orderedSame }
+        if let expected, !same(expected.email, email) {
+            throw GoogleOAuth.OAuthError.wrongAccount(expected: expected.email, actual: email)
+        }
+        return accounts.first { $0.provider == .google && same($0.email, email) }
+    }
+}
+
 public struct GoogleCredentials: Codable, Hashable, Sendable {
     public var clientId: String
     public var clientSecret: String
@@ -94,6 +110,34 @@ public struct GoogleCredentials: Codable, Hashable, Sendable {
     public init(clientId: String, clientSecret: String) {
         self.clientId = clientId
         self.clientSecret = clientSecret
+    }
+
+    /// Pasted values, with the whitespace and newlines that copying from the
+    /// Cloud console tends to bring along removed.
+    public init(pastedClientId: String, clientSecret: String) {
+        self.init(clientId: pastedClientId.trimmingCharacters(in: .whitespacesAndNewlines),
+                  clientSecret: clientSecret.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Why these obviously aren't an OAuth client's ID and secret, if so:
+    /// catches swapped fields and partial pastes before Google does, since
+    /// Google reports a bad client ID on its own error page and never
+    /// redirects back.
+    public var problem: String? {
+        let suffix = ".apps.googleusercontent.com"
+        if clientId.isEmpty || clientSecret.isEmpty {
+            return "Enter both the client ID and the client secret."
+        }
+        if clientSecret.hasSuffix(suffix) && !clientId.hasSuffix(suffix) {
+            return "The fields look swapped: the client ID is the one ending in \(suffix)."
+        }
+        if !clientId.hasSuffix(suffix) {
+            return "The client ID should end in \(suffix)."
+        }
+        if (clientId + clientSecret).contains(where: \.isWhitespace) {
+            return "The client ID and secret can't contain spaces."
+        }
+        return nil
     }
 }
 

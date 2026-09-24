@@ -15,6 +15,8 @@ Native macOS (13+) menu-bar app that polls Gmail and IMAP inboxes for one-time p
   - `OtpCenter` (actor) is the poll loop: per-account watermark + processed ids, in memory only. The first poll of an account only sets a baseline; backlog mail is never processed.
   - `InboxProvider` is the provider surface: `initialWatermark`, `messages(after:skipping:)`, `watermark(for:)`. Watermarks are opaque doubles (epoch seconds for Gmail, UID for IMAP). Calls must be self-contained — no state carried between calls for the poll loop to depend on.
   - `GmailClient` (REST) and `Imap/` (`ImapProvider` → `ImapConnection` → `ImapTransport`, plus `MimeParser`) are the providers.
+  - `GoogleOAuth` runs the browser sign-in through `LoopbackRedirectServer`, which holds the redirect request open until the account is saved, so the browser page reports the real outcome. Google error responses go through `GoogleAPIError`, whose messages say what to fix; add new cases there rather than surfacing raw JSON.
+  - Poll errors are stored as `AccountProblem`, whose `remedy` (automatic / reconnect / manual) decides whether the tray and settings ask the user to act. Classify new error types there.
   - `OtpDetector` holds the heuristics (English + Swedish). Callers NFC-normalise text before detection.
 - `Sources/AuthReach` — the AppKit/SwiftUI app. `AppModel` is the composition root (`@MainActor`); `AppDelegate` owns the tray, HUD panel and settings window.
 - `Tests/AuthReachCoreTests` — XCTest. `ScriptedTransport` in `ImapProviderTests` is an in-memory IMAP server (supports chunked reads and client literals); `StubInbox` in `OtpCenterTests` is the fake provider.
