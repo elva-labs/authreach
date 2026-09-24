@@ -1,7 +1,9 @@
 #!/bin/sh
 # Assembles "AuthReach.app" from the SwiftPM release build.
 # Usage: scripts/make-app.sh [output-dir]        (default: ./build)
-# Env: SIGN_IDENTITY, VERSION, BUILD_NUMBER
+# Env: SIGN_IDENTITY, VERSION, BUILD_NUMBER,
+#      ARCHS (default "arm64 x86_64": a universal binary for Apple silicon
+#      and Intel Macs; set ARCHS=arm64 for a faster local build)
 #
 # SIGN_IDENTITY defaults to the first "Developer ID Application" identity in
 # the login keychain, else "-" (ad-hoc). A Developer ID build is the same
@@ -18,6 +20,9 @@ if [ -z "${SIGN_IDENTITY:-}" ]; then
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
   SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 fi
+ARCHS="${ARCHS:-arm64 x86_64}"
+ARCH_FLAGS=""
+for arch in $ARCHS; do ARCH_FLAGS="$ARCH_FLAGS --arch $arch"; done
 
 if [ -z "${DEVELOPER_DIR:-}" ] \
   && ! xcode-select -p | grep -q "Xcode.app" \
@@ -25,12 +30,21 @@ if [ -z "${DEVELOPER_DIR:-}" ] \
   export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
 fi
 
-swift build -c release
+# shellcheck disable=SC2086 # ARCH_FLAGS is intentionally word-split
+swift build -c release $ARCH_FLAGS
+# The products folder differs between SwiftPM versions and between single-
+# and multi-arch builds, so ask SwiftPM rather than hard-coding it.
+# shellcheck disable=SC2086
+BIN="$(swift build -c release $ARCH_FLAGS --show-bin-path)"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp ".build/release/AuthReach" "$APP/Contents/MacOS/AuthReach"
+cp "$BIN/AuthReach" "$APP/Contents/MacOS/AuthReach"
+for arch in $ARCHS; do
+  lipo "$APP/Contents/MacOS/AuthReach" -verify_arch "$arch" \
+    || { echo "Built binary is missing the $arch slice"; exit 1; }
+done
 cp "Resources/Info.plist" "$APP/Contents/Info.plist"
 if [ -f "Resources/AppIcon.icns" ]; then
   cp "Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
@@ -38,7 +52,7 @@ fi
 
 # SwiftPM dependencies with resources emit .bundle dirs next to the binary;
 # Bundle.module traps at runtime when they're missing from Resources.
-for bundle in .build/release/*.bundle; do
+for bundle in "$BIN"/*.bundle; do
   [ -d "$bundle" ] || continue
   cp -R "$bundle" "$APP/Contents/Resources/"
 done
@@ -52,4 +66,4 @@ else
 fi
 
 codesign --verify --strict "$APP"
-echo "Built: $APP (signed: $SIGN_IDENTITY)"
+echo "Built: $APP ($(lipo -archs "$APP/Contents/MacOS/AuthReach"); signed: $SIGN_IDENTITY)"

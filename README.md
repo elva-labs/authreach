@@ -14,6 +14,8 @@ Native macOS menu-bar app that watches your Gmail and IMAP inboxes and surfaces 
 
 ## Install
 
+Runs on Apple silicon and Intel Macs with macOS 13 or later; releases are universal binaries.
+
 Build from source (macOS 13+, Xcode 15+):
 
 ```sh
@@ -21,6 +23,8 @@ git clone https://github.com/elva-labs/authreach.git
 cd authreach
 make app && make run
 ```
+
+`make app` builds a universal binary. Set `ARCHS=arm64` (or `x86_64`) to build only for your own Mac, which is faster.
 
 A notarized release and Homebrew cask (`elva-labs/elva`) are on the way.
 

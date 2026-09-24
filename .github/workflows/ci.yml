@@ -7,7 +7,14 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: macos-15
+    # Releases are universal (Apple silicon + Intel), so the tests run
+    # natively on both. macos-15-intel is GitHub's last x86_64 image and is
+    # available until August 2027.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Select Xcode
@@ -16,5 +23,6 @@ jobs:
         run: swift build
       - name: Test
         run: swift test
-      - name: Assemble app bundle
-        run: true # app bundle comes with the UI phase
+      - name: Assemble universal app bundle
+        if: matrix.os == 'macos-15'
+        run: scripts/make-app.sh
