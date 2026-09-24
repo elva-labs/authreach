@@ -83,7 +83,7 @@ final class OtpCenterTests: XCTestCase {
         inbox.failNext = true
         await center.pollAll()
         var runtime = await center.runtime(accountId: "a1")
-        XCTAssertEqual(runtime?.lastError, "inbox offline")
+        XCTAssertEqual(runtime?.lastError?.message, "inbox offline")
 
         inbox.mailbox = [mail("m1", at: 1010, subject: "Your passcode is 444444")]
         await center.pollAll()
@@ -154,6 +154,24 @@ final class OtpCenterTests: XCTestCase {
         async let second: Void = center.pollAll()
         _ = await (first, second)
         XCTAssertEqual(notified.value, 1)
+    }
+
+    /// A reconnect while a poll with the old sign-in is still running: that
+    /// poll's failure must not be the last word.
+    func testPollAgainWaitsOutInFlightPollThenPolls() async throws {
+        await center.pollAll()
+        inbox.mailbox = [mail("m1", at: 1010, subject: "Login code 222222")]
+        inbox.delayNanos = 200_000_000
+        inbox.failNext = true
+        async let stale: Void = center.pollAll()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await center.pollAgain(accountId: "a1")
+        // Returned only after a poll that started after the reconnect.
+        let runtime = await center.runtime(accountId: "a1")
+        XCTAssertNil(runtime?.lastError)
+        let recent = await center.recent
+        XCTAssertEqual(recent.map(\.code), ["222222"])
+        await stale
     }
 
     func testAccountRemovedMidPollIsNotResurrected() async throws {

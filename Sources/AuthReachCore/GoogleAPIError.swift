@@ -18,7 +18,7 @@ public enum GoogleAPIError: LocalizedError, Equatable, Sendable {
     case unauthorized
     case rateLimited
     case unavailable(status: Int)
-    /// Wrong client ID or secret.
+    /// Wrong client ID or secret, or the client was deleted.
     case invalidClient
     /// The refresh token expired or was revoked. Google expires them after
     /// 7 days for External apps still in Testing.
@@ -28,9 +28,9 @@ public enum GoogleAPIError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .gmailDisabled:
-            return "The Gmail API isn't enabled in your Google Cloud project. Enable it under APIs & Services → Library, wait a minute, then add the account again."
+            return "The Gmail API isn't enabled in your Google Cloud project. Enable it under APIs & Services → Library, wait a minute, then try again."
         case .scopeNotGranted:
-            return "AuthReach wasn't allowed to read Gmail. Add the account again and tick the Gmail permission on Google's consent screen."
+            return "AuthReach wasn't allowed to read Gmail. Sign in again and tick the Gmail permission on Google's consent screen."
         case .unauthorized:
             return "Google rejected this account's sign-in. Choose Reconnect."
         case .rateLimited:
@@ -38,11 +38,19 @@ public enum GoogleAPIError: LocalizedError, Equatable, Sendable {
         case .unavailable(let status):
             return "Gmail is temporarily unavailable (HTTP \(status)); AuthReach will retry on the next check."
         case .invalidClient:
-            return "Google didn't accept your OAuth client ID or secret. Re-enter them under Google API credentials…"
+            return "Google didn't accept your OAuth client: the ID or secret is wrong, or the client was deleted. Re-enter them under Google API credentials…"
         case .signInExpired:
             return "Google sign-in expired or was revoked. Choose Reconnect. Apps left in Testing have sign-ins expire after 7 days; publishing yours stops that."
         case .other(let status, let message):
             return "Google API error (HTTP \(status)): \(message)"
+        }
+    }
+
+    public var remedy: AccountProblem.Remedy {
+        switch self {
+        case .rateLimited, .unavailable: return .automatic
+        case .unauthorized, .scopeNotGranted, .signInExpired: return .reconnect
+        case .gmailDisabled, .invalidClient, .other: return .manual
         }
     }
 
@@ -67,7 +75,7 @@ public enum GoogleAPIError: LocalizedError, Equatable, Sendable {
     public static func fromTokenEndpoint(status: Int, body: Data, refreshing: Bool) -> GoogleAPIError {
         let parsed = try? JSONDecoder().decode(TokenError.self, from: body)
         switch parsed?.error {
-        case "invalid_client", "unauthorized_client": return .invalidClient
+        case "invalid_client", "unauthorized_client", "deleted_client": return .invalidClient
         case "invalid_grant" where refreshing: return .signInExpired
         default:
             if (500...599).contains(status) { return .unavailable(status: status) }

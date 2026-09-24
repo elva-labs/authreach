@@ -9,7 +9,7 @@ public actor OtpCenter {
         public var email: String
         public var watermark: Double?
         public var processed: Set<String> = []
-        public var lastError: String?
+        public var lastError: AccountProblem?
         public var lastCheckedAt: Date?
     }
 
@@ -21,8 +21,8 @@ public actor OtpCenter {
     private let providerFor: ProviderResolver
     private var providers: [String: any InboxProvider] = [:]
     private var runtimes: [String: AccountRuntime] = [:]
-    /// Accounts with a poll currently running.
-    private var inFlight: Set<String> = []
+    /// The poll currently running for each account.
+    private var inFlight: [String: Task<Void, Never>] = [:]
     public private(set) var recent: [OtpEntry] = []
 
     /// Called for each genuinely new code, oldest first.
@@ -66,17 +66,27 @@ public actor OtpCenter {
     /// whose previous poll is still running is skipped rather than polled
     /// twice. Errors are recorded per-account, never thrown.
     public func pollAll() async {
-        let due = runtimes.keys.filter { !inFlight.contains($0) }
-        inFlight.formUnion(due)
-        await withTaskGroup(of: Void.self) { group in
-            for accountId in due {
-                group.addTask { await self.poll(accountId: accountId) }
-            }
-        }
+        let started = runtimes.keys.filter { inFlight[$0] == nil }.map(startPoll)
+        for poll in started { await poll.value }
+    }
+
+    /// Polls one account now that its credentials changed (a reconnect).
+    /// A poll already running may have started with the old ones, so this
+    /// waits it out rather than skipping, then joins a poll started since or
+    /// starts one.
+    public func pollAgain(accountId: String) async {
+        if let running = inFlight[accountId] { await running.value }
+        await (inFlight[accountId] ?? startPoll(accountId)).value
+    }
+
+    private func startPoll(_ accountId: String) -> Task<Void, Never> {
+        let poll = Task { await self.poll(accountId: accountId) }
+        inFlight[accountId] = poll
+        return poll
     }
 
     private func poll(accountId: String) async {
-        defer { inFlight.remove(accountId) }
+        defer { inFlight[accountId] = nil }
         guard var runtime = runtimes[accountId], let provider = providers[accountId] else { return }
         defer {
             runtime.lastCheckedAt = Date()
@@ -136,7 +146,7 @@ public actor OtpCenter {
             runtime.processed = []
             runtime.lastError = nil
         } catch {
-            runtime.lastError = error.localizedDescription
+            runtime.lastError = AccountProblem(error)
         }
     }
 

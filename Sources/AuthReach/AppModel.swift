@@ -27,11 +27,12 @@ final class AppModel: ObservableObject {
 
     @Published var settings: Settings
     @Published var recent: [OtpEntry] = []
-    @Published var accountStatus: [String: String] = [:] // accountId -> error or ""
+    /// Failing accounts only, keyed by account id.
+    @Published var accountStatus: [String: AccountProblem] = [:]
     @Published var googleCredentialsSet: Bool
     @Published var notice: Notice?
-    @Published private(set) var googleSignInPending = false
-    private var googleSignInTask: Task<Void, Never>?
+    @Published private var googleSignInTask: Task<Void, Never>?
+    var googleSignInPending: Bool { googleSignInTask != nil }
     @Published var localApiError: String?
 
     /// Fires whenever recent codes change, so the tray can refresh.
@@ -94,10 +95,20 @@ final class AppModel: ObservableObject {
 
     func pollNow() async {
         await center.pollAll()
+        await publishPollResults()
+    }
+
+    /// Polls one account right away, e.g. once its sign-in was renewed.
+    func pollAgain(accountId: String) async {
+        await center.pollAgain(accountId: accountId)
+        await publishPollResults()
+    }
+
+    private func publishPollResults() async {
         recent = await center.recent
-        var status: [String: String] = [:]
+        var status: [String: AccountProblem] = [:]
         for account in settings.accounts {
-            status[account.id] = await center.runtime(accountId: account.id)?.lastError ?? ""
+            status[account.id] = await center.runtime(accountId: account.id)?.lastError
         }
         accountStatus = status
         onRecentChanged?()
@@ -138,28 +149,24 @@ final class AppModel: ObservableObject {
     }
 
     /// Starts the browser sign-in. Adding an address that is already
-    /// connected renews that account's sign-in instead of duplicating it,
-    /// which is also how an expired or revoked sign-in is fixed.
-    func addGoogleAccount() {
+    /// connected renews that account's sign-in instead of duplicating it.
+    /// `reconnecting` is the account whose Reconnect button was used: Google
+    /// preselects it, and signing in as anyone else fails.
+    func addGoogleAccount(reconnecting account: ConnectedAccount? = nil) {
         guard googleCredentialsSet else {
             report("Add your Google API credentials first.")
             return
         }
         guard googleSignInTask == nil else { return }
         let accountId = UUID().uuidString
-        googleSignInPending = true
         googleSignInTask = Task {
-            defer {
-                googleSignInTask = nil
-                googleSignInPending = false
-            }
+            defer { googleSignInTask = nil }
             do {
-                try await oauth.authorize(accountId: accountId, openURL: { url in
+                try await oauth.authorize(accountId: accountId, loginHint: account?.email, openURL: { url in
                     Task { @MainActor in NSWorkspace.shared.open(url) }
                 }, complete: {
-                    try await self.finishGoogleSignIn(accountId: accountId)
+                    try await self.finishGoogleSignIn(accountId: accountId, reconnecting: account)
                 })
-                await pollNow()
             } catch {
                 oauth.signOut(accountId: accountId)
                 if !(error is CancellationError) { report(error) }
@@ -173,21 +180,24 @@ final class AppModel: ObservableObject {
 
     /// Runs while the browser waits on the redirect, so its page can say
     /// whether the account was really connected. Returns the address.
-    private func finishGoogleSignIn(accountId: String) async throws -> String {
+    private func finishGoogleSignIn(accountId: String, reconnecting: ConnectedAccount?) async throws -> String {
         let email = try await gmail.profileEmail(accountId: accountId)
         try Task.checkCancellation()
-        if let existing = settings.accounts.first(where: {
-            $0.provider == .google && $0.email.caseInsensitiveCompare(email) == .orderedSame
-        }) {
-            try oauth.moveTokens(from: accountId, to: existing.id)
+        let connectedId: String
+        if let existing = try settings.googleAccount(signedInAs: email, reconnecting: reconnecting) {
+            try await oauth.moveTokens(from: accountId, to: existing.id)
+            connectedId = existing.id
             inform("Reconnected \(email)")
         } else {
             settings = try settingsStore.update { s in
                 s.accounts.append(ConnectedAccount(id: accountId, email: email))
             }
             await center.configureAccounts(settings.accounts)
+            connectedId = accountId
             inform("Connected \(email)")
         }
+        // Not awaited: the browser is still waiting for this to return.
+        Task { await pollAgain(accountId: connectedId) }
         return email
     }
 

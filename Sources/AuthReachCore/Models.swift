@@ -87,6 +87,22 @@ public struct Settings: Codable, Sendable {
     }
 }
 
+extension Settings {
+    /// The connected Google account a finished sign-in as `email` renews,
+    /// or nil when it's a new one. Addresses compare case-insensitively.
+    /// When reconnecting a specific account, signing in as any other
+    /// address throws `OAuthError.wrongAccount` rather than quietly adding
+    /// a second account and leaving the broken one broken.
+    public func googleAccount(signedInAs email: String,
+                              reconnecting expected: ConnectedAccount?) throws -> ConnectedAccount? {
+        func same(_ a: String, _ b: String) -> Bool { a.caseInsensitiveCompare(b) == .orderedSame }
+        if let expected, !same(expected.email, email) {
+            throw GoogleOAuth.OAuthError.wrongAccount(expected: expected.email, actual: email)
+        }
+        return accounts.first { $0.provider == .google && same($0.email, email) }
+    }
+}
+
 public struct GoogleCredentials: Codable, Hashable, Sendable {
     public var clientId: String
     public var clientSecret: String

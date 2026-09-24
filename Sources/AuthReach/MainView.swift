@@ -49,12 +49,14 @@ struct MainView: View {
                     Text(account.provider == .google ? "Gmail" : "IMAP")
                         .font(.caption2).foregroundStyle(.tertiary)
                     Spacer()
-                    if let error = model.accountStatus[account.id], !error.isEmpty {
-                        Text(error).font(.caption).foregroundStyle(.red)
+                    if let problem = model.accountStatus[account.id] {
+                        // Problems that clear up on their own aren't shown as errors.
+                        Text(problem.message).font(.caption)
+                            .foregroundStyle(problem.needsAttention ? Color.red : Color.secondary)
                             .lineLimit(2).truncationMode(.tail)
-                            .help(error)
-                        if account.provider == .google {
-                            Button("Reconnect") { model.addGoogleAccount() }
+                            .help(problem.message)
+                        if account.provider == .google, problem.remedy == .reconnect {
+                            Button("Reconnect") { model.addGoogleAccount(reconnecting: account) }
                                 .controlSize(.small)
                                 .disabled(model.googleSignInPending)
                                 .help("Sign in to \(account.email) again in your browser")

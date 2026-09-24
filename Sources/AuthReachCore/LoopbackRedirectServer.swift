@@ -3,8 +3,9 @@ import Network
 
 /// One-shot HTTP server for the OAuth redirect of an installed app
 /// (RFC 8252 §7.3): bound to an explicit high port on 127.0.0.1, it hands
-/// back the query of the first `/callback` request and keeps that request
-/// open until `finish(_:)`. The browser therefore shows the real outcome —
+/// back the query of the first `/callback` request and keeps the latest
+/// `/callback` request open until `finish(_:)`. The browser therefore shows
+/// the real outcome —
 /// token exchange and account lookup included — instead of claiming success
 /// as soon as Google redirects.
 final class LoopbackRedirectServer: @unchecked Sendable {
@@ -129,13 +130,23 @@ final class LoopbackRedirectServer: @unchecked Sendable {
                 return
             }
             lock.lock()
-            guard callback == nil, !closed else {
+            if closed {
                 lock.unlock()
-                // A reload after the flow ended: say so rather than hang.
+                // A request after the flow ended: say so rather than hang.
                 connection.send(content: Data(Self.response(Self.page(
                     title: "Nothing to do here",
                     message: "This sign-in has already finished. You can close this window.")).utf8),
                     completion: .contentProcessed { _ in connection.cancel() })
+                return
+            }
+            if callback != nil {
+                // The tab was reloaded while the sign-in finishes. The browser
+                // has given up on the earlier request, so the outcome goes to
+                // this one.
+                let abandoned = callbackConnection
+                callbackConnection = connection
+                lock.unlock()
+                abandoned?.cancel()
                 return
             }
             callback = .success(query)

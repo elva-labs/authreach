@@ -51,7 +51,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         // A broken account otherwise fails silently until someone opens
         // Settings, and its codes just stop arriving.
-        let failing = model.settings.accounts.filter { !(model.accountStatus[$0.id] ?? "").isEmpty }
+        // Errors that clear up on their own (rate limits, outages) aren't listed.
+        let failing = model.settings.accounts.filter { model.accountStatus[$0.id]?.needsAttention == true }
         if !failing.isEmpty {
             menu.addItem(.separator())
             let title = failing.count == 1
@@ -60,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let item = NSMenuItem(title: title, action: #selector(openMain), keyEquivalent: "")
             item.target = self
             item.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: "Warning")
-            item.toolTip = failing.map { "\($0.email): \(model.accountStatus[$0.id] ?? "")" }.joined(separator: "\n")
+            item.toolTip = failing.map { "\($0.email): \(model.accountStatus[$0.id]?.message ?? "")" }.joined(separator: "\n")
             menu.addItem(item)
         }
         menu.addItem(.separator())

@@ -16,10 +16,13 @@ public struct OAuthTokens: Codable, Sendable {
 
 public final class GoogleOAuth: @unchecked Sendable {
     public static let scope = "https://www.googleapis.com/auth/gmail.readonly"
-    private let keychain: KeychainStore
+    private let keychain: any SecretStore
     private let credentialsProvider: @Sendable () -> GoogleCredentials?
+    /// Serialises read-modify-write of stored tokens, so a refresh that was
+    /// in flight during a reconnect can't overwrite the new sign-in.
+    private let tokenLock = NSLock()
 
-    public init(keychain: KeychainStore = KeychainStore(),
+    public init(keychain: any SecretStore = KeychainStore(),
                 credentialsProvider: @escaping @Sendable () -> GoogleCredentials?) {
         self.keychain = keychain
         self.credentialsProvider = credentialsProvider
@@ -30,6 +33,9 @@ public final class GoogleOAuth: @unchecked Sendable {
         case notConnected
         case consentDeclined
         case timedOut
+        /// Reconnect signed in to a different Google account than the one
+        /// being reconnected.
+        case wrongAccount(expected: String, actual: String)
         case flowFailed(String)
         public var errorDescription: String? {
             switch self {
@@ -38,7 +44,16 @@ public final class GoogleOAuth: @unchecked Sendable {
             case .consentDeclined: return "Sign-in was cancelled on Google's consent screen."
             case .timedOut:
                 return "Timed out waiting for Google sign-in. If Google showed an error page instead, check that your OAuth client is a Desktop app and that this Google account is a test user (or the app is published)."
+            case .wrongAccount(let expected, let actual):
+                return "You signed in as \(actual), not \(expected). Choose Reconnect again and pick \(expected) in Google's account chooser."
             case .flowFailed(let reason): return "Google sign-in failed: \(reason)"
+            }
+        }
+
+        public var remedy: AccountProblem.Remedy {
+            switch self {
+            case .notConnected: return .reconnect
+            case .noCredentials, .consentDeclined, .timedOut, .wrongAccount, .flowFailed: return .manual
             }
         }
     }
@@ -58,25 +73,37 @@ public final class GoogleOAuth: @unchecked Sendable {
 
     /// Moves an account's tokens to another id, replacing any there; used
     /// when a sign-in turns out to be an account that is already connected.
-    public func moveTokens(from source: String, to destination: String) throws {
-        guard let tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(source)) else {
-            throw OAuthError.notConnected
+    /// `async` so the Keychain access (which can block on a prompt) runs off
+    /// the caller's actor.
+    public func moveTokens(from source: String, to destination: String) async throws {
+        try withTokenLock {
+            guard let tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(source)) else {
+                throw OAuthError.notConnected
+            }
+            try keychain.set(tokens, forKey: tokenKey(destination))
+            keychain.remove(forKey: tokenKey(source))
         }
-        try keychain.set(tokens, forKey: tokenKey(destination))
-        keychain.remove(forKey: tokenKey(source))
+    }
+
+    private func withTokenLock<T>(_ body: () throws -> T) rethrows -> T {
+        tokenLock.lock()
+        defer { tokenLock.unlock() }
+        return try body()
     }
 
     // MARK: - Browser flow
 
     /// Runs the full flow: starts a loopback listener, opens the consent URL
     /// (via `openURL`), waits for the redirect, exchanges the code and
-    /// stores tokens for `accountId`. `complete` then finishes connecting the
+    /// stores tokens for `accountId`. `loginHint` preselects that address in
+    /// Google's account chooser. `complete` then finishes connecting the
     /// account and returns what to name it in the browser (its address);
     /// the redirect request is only answered after that, so the browser page
     /// reports the real outcome. Throws `CancellationError` if the calling
     /// task is cancelled while waiting.
     @discardableResult
     public func authorize(accountId: String,
+                          loginHint: String? = nil,
                           openURL: @escaping @Sendable (URL) -> Void,
                           complete: @Sendable () async throws -> String) async throws -> String {
         guard let credentials = credentialsProvider() else { throw OAuthError.noCredentials }
@@ -84,17 +111,7 @@ public final class GoogleOAuth: @unchecked Sendable {
         let server = try LoopbackRedirectServer.start()
         let redirectUri = "http://127.0.0.1:\(server.port)/callback"
 
-        var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
-        components.queryItems = [
-            URLQueryItem(name: "client_id", value: credentials.clientId),
-            URLQueryItem(name: "redirect_uri", value: redirectUri),
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "scope", value: Self.scope),
-            URLQueryItem(name: "access_type", value: "offline"),
-            // Force the consent screen so Google re-issues a refresh token.
-            URLQueryItem(name: "prompt", value: "consent"),
-        ]
-        openURL(components.url!)
+        openURL(Self.consentURL(clientId: credentials.clientId, redirectUri: redirectUri, loginHint: loginHint))
 
         let query = try await server.waitForCallback(timeout: Self.consentTimeout)
         do {
@@ -124,6 +141,23 @@ public final class GoogleOAuth: @unchecked Sendable {
         }
     }
 
+    static func consentURL(clientId: String, redirectUri: String, loginHint: String?) -> URL {
+        var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
+        components.queryItems = [
+            URLQueryItem(name: "client_id", value: clientId),
+            URLQueryItem(name: "redirect_uri", value: redirectUri),
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "scope", value: Self.scope),
+            URLQueryItem(name: "access_type", value: "offline"),
+            // Force the consent screen so Google re-issues a refresh token.
+            URLQueryItem(name: "prompt", value: "consent"),
+        ]
+        if let loginHint {
+            components.queryItems?.append(URLQueryItem(name: "login_hint", value: loginHint))
+        }
+        return components.url!
+    }
+
     /// The `code` of a redirect, or the error Google redirected with
     /// instead (RFC 6749 §4.1.2.1): `access_denied` when the user declines.
     static func authorizationCode(from query: [String: String]) throws -> String {
@@ -139,7 +173,7 @@ public final class GoogleOAuth: @unchecked Sendable {
 
     /// A live access token for the account, refreshing if stale.
     public func accessToken(accountId: String) async throws -> String {
-        guard var tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(accountId)) else {
+        guard let tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(accountId)) else {
             throw OAuthError.notConnected
         }
         if tokens.isFresh { return tokens.accessToken }
@@ -151,11 +185,26 @@ public final class GoogleOAuth: @unchecked Sendable {
             "client_secret": credentials.clientSecret,
             "grant_type": "refresh_token",
         ])
-        tokens.accessToken = refreshed.accessToken
-        tokens.expiresAt = refreshed.expiresAt
-        if let newRefresh = refreshed.refreshToken { tokens.refreshToken = newRefresh }
-        try keychain.set(tokens, forKey: tokenKey(accountId))
-        return tokens.accessToken
+        guard try commitRefresh(refreshed, accountId: accountId, refreshedWith: refreshToken) else {
+            // A sign-in replaced (or removed) the tokens while this refresh
+            // was in flight; use whatever is stored now.
+            return try await accessToken(accountId: accountId)
+        }
+        return refreshed.accessToken
+    }
+
+    /// Stores a refresh result, unless the account's tokens no longer hold
+    /// the refresh token it was made with. Returns whether it stored.
+    func commitRefresh(_ refreshed: OAuthTokens, accountId: String, refreshedWith refreshToken: String) throws -> Bool {
+        try withTokenLock {
+            guard var tokens = keychain.get(OAuthTokens.self, forKey: tokenKey(accountId)),
+                  tokens.refreshToken == refreshToken else { return false }
+            tokens.accessToken = refreshed.accessToken
+            tokens.expiresAt = refreshed.expiresAt
+            if let newRefresh = refreshed.refreshToken { tokens.refreshToken = newRefresh }
+            try keychain.set(tokens, forKey: tokenKey(accountId))
+            return true
+        }
     }
 
     // MARK: - Token endpoint
