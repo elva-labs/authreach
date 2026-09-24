@@ -4,9 +4,9 @@ Native macOS (13+) menu-bar app that polls Gmail and IMAP inboxes for one-time p
 
 ## Commands
 
-- `swift build` / `swift test` (`make build` / `make test`). CI runs exactly these on macOS 15; keep them green.
+- `swift build` / `swift test` (`make build` / `make test`). CI runs these on macOS 15 on both Apple silicon and Intel, then assembles a universal app on the Apple silicon runner; keep them green.
 - `swift test --filter ImapProviderTests` to run one suite.
-- `make app` assembles `build/AuthReach.app` via `scripts/make-app.sh` (release build, signed). `make run` quits any running AuthReach, waits for it to exit, then opens the fresh build.
+- `make app` assembles `build/AuthReach.app` via `scripts/make-app.sh` (release build, signed, host architecture only). `AUTHREACH_ARCHS="arm64 x86_64"` builds each architecture separately and merges them with `lipo`; CI and releases set it. `make run` quits any running AuthReach, waits for it to exit, then opens the fresh build.
 - Local signing: `make-app.sh` picks the first "Developer ID Application" identity from the keychain, else ad-hoc. Ad-hoc builds are a new code identity every time, so each Keychain read prompts. CI sets `SIGN_IDENTITY` explicitly.
 
 ## Layout
