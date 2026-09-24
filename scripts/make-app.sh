@@ -21,8 +21,6 @@ if [ -z "${SIGN_IDENTITY:-}" ]; then
   SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 fi
 ARCHS="${ARCHS:-arm64 x86_64}"
-ARCH_FLAGS=""
-for arch in $ARCHS; do ARCH_FLAGS="$ARCH_FLAGS --arch $arch"; done
 
 if [ -z "${DEVELOPER_DIR:-}" ] \
   && ! xcode-select -p | grep -q "Xcode.app" \
@@ -30,17 +28,26 @@ if [ -z "${DEVELOPER_DIR:-}" ] \
   export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
 fi
 
-# shellcheck disable=SC2086 # ARCH_FLAGS is intentionally word-split
-swift build -c release $ARCH_FLAGS
-# The products folder differs between SwiftPM versions and between single-
-# and multi-arch builds, so ask SwiftPM rather than hard-coding it.
-# shellcheck disable=SC2086
-BIN="$(swift build -c release $ARCH_FLAGS --show-bin-path)"
+# One build per architecture, merged with lipo. A single multi-arch
+# `swift build --arch arm64 --arch x86_64` goes through a different build
+# system that, on Xcode 16.x, fails to build package dependencies
+# ("no such module 'KeyboardShortcuts'"). Each slice is copied out right
+# away: depending on the SwiftPM version, both builds can share one
+# products folder, which is why the folder is asked for, not hard-coded.
+SLICES_DIR="$(mktemp -d)"
+trap 'rm -rf "$SLICES_DIR"' EXIT
+for arch in $ARCHS; do
+  swift build -c release --arch "$arch"
+  BIN="$(swift build -c release --arch "$arch" --show-bin-path)"
+  cp "$BIN/AuthReach" "$SLICES_DIR/AuthReach-$arch"
+done
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp "$BIN/AuthReach" "$APP/Contents/MacOS/AuthReach"
+# shellcheck disable=SC2046 # one path per slice, none contain spaces
+lipo -create $(for arch in $ARCHS; do echo "$SLICES_DIR/AuthReach-$arch"; done) \
+  -output "$APP/Contents/MacOS/AuthReach"
 for arch in $ARCHS; do
   lipo "$APP/Contents/MacOS/AuthReach" -verify_arch "$arch" \
     || { echo "Built binary is missing the $arch slice"; exit 1; }
