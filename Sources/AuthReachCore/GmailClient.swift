@@ -56,7 +56,15 @@ public struct GmailClient: InboxProvider {
         Date().timeIntervalSince1970.rounded(.down)
     }
 
-    public func listMessageIds(accountId: String, after watermark: Double) async throws -> [String] {
+    public func messages(accountId: String, after watermark: Double, skipping: Set<String>) async throws -> [FetchedMessage] {
+        var fetched: [FetchedMessage] = []
+        for id in try await listMessageIds(accountId: accountId, after: watermark) where !skipping.contains(id) {
+            fetched.append(try await message(accountId: accountId, id: id))
+        }
+        return fetched.sorted { $0.receivedAt < $1.receivedAt }
+    }
+
+    func listMessageIds(accountId: String, after watermark: Double) async throws -> [String] {
         let query = "in:inbox after:\(Int(watermark))"
             .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)!
         let response = try await fetch(ListResponse.self, accountId: accountId,
@@ -86,7 +94,7 @@ public struct GmailClient: InboxProvider {
         let payload: Part?
     }
 
-    public func message(accountId: String, id: String) async throws -> FetchedMessage {
+    func message(accountId: String, id: String) async throws -> FetchedMessage {
         let msg = try await fetch(Message.self, accountId: accountId,
                                   pathAndQuery: "/messages/\(id)?format=full")
         return Self.fetchedMessage(from: msg)

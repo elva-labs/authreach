@@ -35,7 +35,7 @@ public struct ConnectedAccount: Codable, Hashable, Sendable, Identifiable {
 
     public enum Provider: String, Codable, Sendable {
         case google
-        case imap // storage-compatible with the original; not yet supported natively
+        case imap
     }
 
     public init(id: String = UUID().uuidString, email: String, provider: Provider = .google) {
@@ -98,7 +98,7 @@ public struct GoogleCredentials: Codable, Hashable, Sendable {
 }
 
 /// A fetched, text-extracted email — the provider-agnostic unit the poll
-/// loop and detector consume (same surface for Gmail today, IMAP later).
+/// loop and detector consume, whether it came from Gmail or IMAP.
 public struct FetchedMessage: Sendable {
     public let id: String
     public let subject: String

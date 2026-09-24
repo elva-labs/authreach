@@ -7,14 +7,16 @@ final class StubInbox: InboxProvider, @unchecked Sendable {
     var mailbox: [FetchedMessage] = []
     var baseline: Double = 1000
     var failNext = false
+    var resetNext = false
+    /// Makes each fetch take this long, to hold a poll in flight.
+    var delayNanos: UInt64 = 0
 
     func initialWatermark(accountId: String) async throws -> Double { baseline }
-    func listMessageIds(accountId: String, after watermark: Double) async throws -> [String] {
+    func messages(accountId: String, after watermark: Double, skipping: Set<String>) async throws -> [FetchedMessage] {
+        if delayNanos > 0 { try await Task.sleep(nanoseconds: delayNanos) }
         if failNext { failNext = false; throw NSError(domain: "stub", code: 1, userInfo: [NSLocalizedDescriptionKey: "inbox offline"]) }
-        return mailbox.filter { $0.receivedAt / 1000 > watermark }.map(\.id)
-    }
-    func message(accountId: String, id: String) async throws -> FetchedMessage {
-        mailbox.first { $0.id == id }!
+        if resetNext { resetNext = false; throw InboxProviderError.baselineReset }
+        return mailbox.filter { $0.receivedAt / 1000 > watermark && !skipping.contains($0.id) }
     }
     func watermark(for message: FetchedMessage) -> Double { message.receivedAt / 1000 }
 }
@@ -102,6 +104,69 @@ final class OtpCenterTests: XCTestCase {
         XCTAssertEqual(recent.first?.code, "100025")
     }
 
+    func testBaselineResetRebaselinesSilently() async {
+        await center.pollAll() // baseline 1000
+        inbox.mailbox = [mail("m1", at: 1010, subject: "Login code 222222")]
+        await center.pollAll()
+        // UIDs renumbered: the provider asks for a reset, no error is shown.
+        inbox.resetNext = true
+        inbox.baseline = 5
+        await center.pollAll()
+        var runtime = await center.runtime(accountId: "a1")
+        XCTAssertNil(runtime?.lastError)
+        XCTAssertNil(runtime?.watermark)
+        // Next tick baselines again from the provider's new numbering.
+        await center.pollAll()
+        runtime = await center.runtime(accountId: "a1")
+        XCTAssertEqual(runtime?.watermark, 5)
+        inbox.mailbox = [mail("m2", at: 6, subject: "Login code 333333")]
+        await center.pollAll()
+        let recent = await center.recent
+        XCTAssertEqual(recent.map(\.code), ["333333", "222222"])
+    }
+
+    func testProviderIsChosenPerAccount() async {
+        let imapInbox = StubInbox()
+        imapInbox.baseline = 100
+        let gmailInbox = inbox!
+        let routed = OtpCenter(providerFor: { $0.provider == .imap ? imapInbox : gmailInbox })
+        await routed.configureAccounts([
+            ConnectedAccount(id: "g", email: "g@example.com", provider: .google),
+            ConnectedAccount(id: "i", email: "i@example.com", provider: .imap),
+        ])
+        await routed.pollAll()
+        gmailInbox.mailbox = [mail("m1", at: 1010, subject: "Login code 111111")]
+        imapInbox.mailbox = [mail("7", at: 110, subject: "Login code 222222", from: "IMAP <imap@example.com>")]
+        await routed.pollAll()
+        let recent = await routed.recent
+        XCTAssertEqual(Set(recent.map(\.code)), ["111111", "222222"])
+        XCTAssertEqual(recent.first { $0.code == "222222" }?.accountEmail, "i@example.com")
+    }
+
+    func testOverlappingPollsProcessEachMessageOnce() async {
+        await center.pollAll()
+        inbox.mailbox = [mail("m1", at: 1010, subject: "Login code 222222")]
+        inbox.delayNanos = 200_000_000
+        let notified = Tally()
+        await center.setOnNewCode { _ in notified.increment() }
+        // A timer tick firing while the previous (slow) poll is still running.
+        async let first: Void = center.pollAll()
+        async let second: Void = center.pollAll()
+        _ = await (first, second)
+        XCTAssertEqual(notified.value, 1)
+    }
+
+    func testAccountRemovedMidPollIsNotResurrected() async throws {
+        await center.pollAll()
+        inbox.delayNanos = 200_000_000
+        async let poll: Void = center.pollAll()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await center.configureAccounts([])
+        await poll
+        let runtime = await center.runtime(accountId: "a1")
+        XCTAssertNil(runtime)
+    }
+
     func testRemovedAccountStopsPolling() async {
         await center.configureAccounts([])
         inbox.mailbox = [mail("m1", at: 1010, subject: "code 555555")]
@@ -109,6 +174,13 @@ final class OtpCenterTests: XCTestCase {
         let recent = await center.recent
         XCTAssertTrue(recent.isEmpty)
     }
+}
+
+final class Tally: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func increment() { lock.lock(); count += 1; lock.unlock() }
 }
 
 final class GmailParsingTests: XCTestCase {

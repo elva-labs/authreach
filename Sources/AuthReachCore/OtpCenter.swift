@@ -15,15 +15,26 @@ public actor OtpCenter {
 
     public static let maxRecent = 20
 
-    private let provider: any InboxProvider
+    /// Picks the inbox provider for an account (Gmail vs IMAP).
+    public typealias ProviderResolver = @Sendable (ConnectedAccount) -> any InboxProvider
+
+    private let providerFor: ProviderResolver
+    private var providers: [String: any InboxProvider] = [:]
     private var runtimes: [String: AccountRuntime] = [:]
+    /// Accounts with a poll currently running.
+    private var inFlight: Set<String> = []
     public private(set) var recent: [OtpEntry] = []
 
     /// Called for each genuinely new code, oldest first.
     private var onNewCode: (@Sendable (OtpEntry) -> Void)?
 
+    public init(providerFor: @escaping ProviderResolver) {
+        self.providerFor = providerFor
+    }
+
+    /// Single-provider convenience (tests, or a Gmail-only setup).
     public init(provider: any InboxProvider) {
-        self.provider = provider
+        self.init(providerFor: { _ in provider })
     }
 
     public func setOnNewCode(_ handler: @escaping @Sendable (OtpEntry) -> Void) {
@@ -32,11 +43,14 @@ public actor OtpCenter {
 
     public func configureAccounts(_ accounts: [ConnectedAccount]) {
         var next: [String: AccountRuntime] = [:]
+        var nextProviders: [String: any InboxProvider] = [:]
         for account in accounts {
             next[account.id] = runtimes[account.id] ?? AccountRuntime(email: account.email)
             next[account.id]?.email = account.email
+            nextProviders[account.id] = providerFor(account)
         }
         runtimes = next
+        providers = nextProviders
     }
 
     public func runtime(accountId: String) -> AccountRuntime? {
@@ -47,19 +61,31 @@ public actor OtpCenter {
         recent = []
     }
 
-    /// One poll tick across every configured account. Errors are recorded
-    /// per-account, never thrown — one broken inbox must not stop the rest.
+    /// One poll tick across every configured account. Accounts poll in
+    /// parallel so one slow inbox can't hold up the rest, and an account
+    /// whose previous poll is still running is skipped rather than polled
+    /// twice. Errors are recorded per-account, never thrown.
     public func pollAll() async {
-        for accountId in runtimes.keys {
-            await poll(accountId: accountId)
+        let due = runtimes.keys.filter { !inFlight.contains($0) }
+        inFlight.formUnion(due)
+        await withTaskGroup(of: Void.self) { group in
+            for accountId in due {
+                group.addTask { await self.poll(accountId: accountId) }
+            }
         }
     }
 
     private func poll(accountId: String) async {
-        guard var runtime = runtimes[accountId] else { return }
+        defer { inFlight.remove(accountId) }
+        guard var runtime = runtimes[accountId], let provider = providers[accountId] else { return }
         defer {
             runtime.lastCheckedAt = Date()
-            runtimes[accountId] = runtime
+            // The account may have been removed or renamed while this poll
+            // was suspended; don't resurrect it or clobber the new email.
+            if let current = runtimes[accountId] {
+                runtime.email = current.email
+                runtimes[accountId] = runtime
+            }
         }
         do {
             guard let watermark = runtime.watermark else {
@@ -69,12 +95,11 @@ public actor OtpCenter {
                 return
             }
 
-            let ids = try await provider.listMessageIds(accountId: accountId, after: watermark)
+            let messages = try await provider.messages(accountId: accountId, after: watermark,
+                                                       skipping: runtime.processed)
             var newest = watermark
-            for id in ids where !runtime.processed.contains("\(accountId):\(id)") {
-                let message = try await provider.message(accountId: accountId, id: id)
-                let entryId = "\(accountId):\(message.id)"
-                runtime.processed.insert(entryId)
+            for message in messages where !runtime.processed.contains(message.id) {
+                runtime.processed.insert(message.id)
                 newest = max(newest, provider.watermark(for: message))
 
                 // NFC so decomposed "a" + U+0308 still matches the precomposed
@@ -87,7 +112,7 @@ public actor OtpCenter {
 
                 let expirySeconds = OtpDetector.detectExpirySeconds(in: text)
                 let entry = OtpEntry(
-                    id: entryId,
+                    id: "\(accountId):\(message.id)",
                     code: code,
                     service: OtpDetector.serviceFromSender(message.from),
                     sender: OtpDetector.addressFromSender(message.from),
@@ -104,6 +129,12 @@ public actor OtpCenter {
             // Keep the processed set bounded; ids older than the watermark
             // can never be listed again.
             if runtime.processed.count > 500 { runtime.processed = [] }
+        } catch InboxProviderError.baselineReset {
+            // Ids were renumbered under us; start over from a fresh baseline
+            // next tick rather than trusting the old watermark.
+            runtime.watermark = nil
+            runtime.processed = []
+            runtime.lastError = nil
         } catch {
             runtime.lastError = error.localizedDescription
         }

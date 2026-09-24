@@ -3,13 +3,14 @@ import AuthReachCore
 import Foundation
 import UserNotifications
 
-/// Composition root: settings + keychain + OAuth + Gmail + poll loop +
-/// local API, published for SwiftUI and the tray.
+/// Composition root: settings + keychain + OAuth + Gmail + IMAP + poll
+/// loop + local API, published for SwiftUI and the tray.
 @MainActor
 final class AppModel: ObservableObject {
     let settingsStore = SettingsStore.standard()
     let keychain = KeychainStore()
     let oauth: GoogleOAuth
+    let imap: ImapProvider
     let center: OtpCenter
     private var apiServer: LocalApiServer?
     private var pollTimer: Timer?
@@ -24,13 +25,17 @@ final class AppModel: ObservableObject {
     /// Fires whenever recent codes change, so the tray can refresh.
     var onRecentChanged: (() -> Void)?
 
-    private static let credentialsKey = "google-credentials"
+    nonisolated private static let credentialsKey = "google-credentials"
+    nonisolated private static func imapKey(_ accountId: String) -> String { "imap-account:\(accountId)" }
 
     init() {
         let settings = settingsStore.load()
         self.settings = settings
         let keychain = self.keychain
-        self.googleCredentialsSet = keychain.get(GoogleCredentials.self, forKey: Self.credentialsKey) != nil
+        // Resolved below, off the main thread: a Keychain read can block on a
+        // user prompt (e.g. a differently-signed dev build reading items the
+        // release created), and this runs before the tray icon exists.
+        self.googleCredentialsSet = false
         let oauth = GoogleOAuth(keychain: keychain) {
             keychain.get(GoogleCredentials.self, forKey: Self.credentialsKey)
         }
@@ -38,7 +43,16 @@ final class AppModel: ObservableObject {
         let gmail = GmailClient(tokenProvider: { accountId in
             try await oauth.accessToken(accountId: accountId)
         })
-        self.center = OtpCenter(provider: gmail)
+        let imap = ImapProvider(credentialsProvider: { accountId in
+            keychain.get(ImapCredentials.self, forKey: Self.imapKey(accountId))
+        })
+        self.imap = imap
+        self.center = OtpCenter(providerFor: { account -> any InboxProvider in
+            switch account.provider {
+            case .google: return gmail
+            case .imap: return imap
+            }
+        })
 
         Task {
             await center.configureAccounts(settings.accounts)
@@ -48,6 +62,9 @@ final class AppModel: ObservableObject {
             self.startPolling()
             self.syncLocalApi()
             if settings.notify { Self.requestNotificationPermission() }
+            self.googleCredentialsSet = await Task.detached {
+                keychain.get(GoogleCredentials.self, forKey: Self.credentialsKey) != nil
+            }.value
         }
     }
 
@@ -131,8 +148,30 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Verifies the credentials against the server (sign-in + read-only
+    /// INBOX open) before anything is stored. Throws with a user-facing
+    /// message so the sheet can show it inline.
+    func addImapAccount(email: String, credentials: ImapCredentials) async throws {
+        try await imap.verify(credentials)
+        // The sheet was cancelled while we were connecting: save nothing.
+        try Task.checkCancellation()
+        let accountId = UUID().uuidString
+        try keychain.set(credentials, forKey: Self.imapKey(accountId))
+        settings = try settingsStore.update { s in
+            s.accounts.append(ConnectedAccount(id: accountId, email: email, provider: .imap))
+        }
+        await center.configureAccounts(settings.accounts)
+        notice = "Connected \(email)"
+        await pollNow()
+    }
+
     func disconnect(account: ConnectedAccount) {
-        oauth.signOut(accountId: account.id)
+        switch account.provider {
+        case .google: oauth.signOut(accountId: account.id)
+        case .imap:
+            keychain.remove(forKey: Self.imapKey(account.id))
+            Task { [imap] in await imap.forget(accountId: account.id) }
+        }
         do {
             settings = try settingsStore.update { s in
                 s.accounts.removeAll { $0.id == account.id }

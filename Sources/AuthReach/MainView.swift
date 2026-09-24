@@ -6,6 +6,7 @@ import SwiftUI
 struct MainView: View {
     @ObservedObject var model: AppModel
     @State private var showCredentialsSheet = false
+    @State private var showImapSheet = false
 
     var body: some View {
         Form {
@@ -18,6 +19,9 @@ struct MainView: View {
         .frame(width: 520, height: 620)
         .sheet(isPresented: $showCredentialsSheet) {
             CredentialsSheet(model: model, isPresented: $showCredentialsSheet)
+        }
+        .sheet(isPresented: $showImapSheet) {
+            ImapAccountSheet(model: model, isPresented: $showImapSheet)
         }
         .overlay(alignment: .bottom) {
             if let notice = model.notice {
@@ -44,6 +48,8 @@ struct MainView: View {
                 HStack {
                     Image(systemName: "envelope").foregroundStyle(.secondary)
                     Text(account.email)
+                    Text(account.provider == .google ? "Gmail" : "IMAP")
+                        .font(.caption2).foregroundStyle(.tertiary)
                     Spacer()
                     if let error = model.accountStatus[account.id], !error.isEmpty {
                         Text(error).font(.caption).foregroundStyle(.red)
@@ -62,6 +68,7 @@ struct MainView: View {
             HStack {
                 Button("Add Google account…") { model.addGoogleAccount() }
                     .disabled(!model.googleCredentialsSet)
+                Button("Add IMAP account…") { showImapSheet = true }
                 Spacer()
                 Button(model.googleCredentialsSet ? "Google API credentials…" : "Set up Google API credentials…") {
                     showCredentialsSheet = true
@@ -195,6 +202,111 @@ struct CredentialsSheet: View {
     }
 }
 
+
+/// Generic IMAP account: host/port/username/password, verified against the
+/// server before being stored in the Keychain.
+struct ImapAccountSheet: View {
+    @ObservedObject var model: AppModel
+    @Binding var isPresented: Bool
+    @State private var email = ""
+    @State private var host = ""
+    @State private var port = 993
+    @State private var username = ""
+    @State private var password = ""
+    @State private var isConnecting = false
+    @State private var error: String?
+    @State private var connectTask: Task<Void, Never>?
+
+    /// Hosts for common providers, filled in from the address domain.
+    private static let knownHosts: [String: String] = [
+        "gmail.com": "imap.gmail.com", "googlemail.com": "imap.gmail.com",
+        "icloud.com": "imap.mail.me.com", "me.com": "imap.mail.me.com", "mac.com": "imap.mail.me.com",
+        "fastmail.com": "imap.fastmail.com", "fastmail.fm": "imap.fastmail.com",
+        "yahoo.com": "imap.mail.yahoo.com", "yahoo.se": "imap.mail.yahoo.com",
+        "gmx.com": "imap.gmx.com", "gmx.de": "imap.gmx.net", "gmx.net": "imap.gmx.net",
+    ]
+
+    private var canConnect: Bool {
+        !email.isEmpty && !host.isEmpty && !password.isEmpty && (1...65535).contains(port) && !isConnecting
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Add IMAP account").font(.headline)
+            Text("Works with any IMAP server over TLS (port 993). Use an app-specific password where your provider requires one (Gmail, iCloud, Yahoo). Credentials are stored in your Keychain; the inbox is opened read-only.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 8) {
+                GridRow {
+                    Text("Email")
+                    TextField("you@example.com", text: $email)
+                        .onChange(of: email) { _ in suggestHost() }
+                }
+                GridRow {
+                    Text("Server")
+                    HStack {
+                        TextField("imap.example.com", text: $host)
+                        TextField("Port", value: $port, format: .number.grouping(.never))
+                            .frame(width: 64)
+                    }
+                }
+                GridRow {
+                    Text("Username")
+                    TextField("Same as email", text: $username)
+                }
+                GridRow {
+                    Text("Password")
+                    SecureField("App password", text: $password)
+                }
+            }
+            .textFieldStyle(.roundedBorder)
+            if let error {
+                Text(error).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                if isConnecting { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Cancel") {
+                    connectTask?.cancel()
+                    isPresented = false
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Connect") { connect() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canConnect)
+            }
+        }
+        .padding(16)
+        .frame(width: 460)
+    }
+
+    private func suggestHost() {
+        guard host.isEmpty, let at = email.lastIndex(of: "@") else { return }
+        let domain = email[email.index(after: at)...].lowercased()
+        if let known = Self.knownHosts[domain] { host = known }
+    }
+
+    private func connect() {
+        error = nil
+        isConnecting = true
+        let trimmedEmail = email.trimmingCharacters(in: .whitespaces)
+        let credentials = ImapCredentials(
+            host: host.trimmingCharacters(in: .whitespaces),
+            port: port,
+            username: username.isEmpty ? trimmedEmail : username.trimmingCharacters(in: .whitespaces),
+            password: password)
+        connectTask = Task {
+            do {
+                try await model.addImapAccount(email: trimmedEmail, credentials: credentials)
+                isPresented = false
+            } catch {
+                if !Task.isCancelled { self.error = error.localizedDescription }
+            }
+            isConnecting = false
+        }
+    }
+}
 
 struct LaunchAtLoginToggle: View {
     @State private var enabled = SMAppService.mainApp.status == .enabled
