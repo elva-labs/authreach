@@ -25,14 +25,17 @@ final class AppModel: ObservableObject {
     /// Fires whenever recent codes change, so the tray can refresh.
     var onRecentChanged: (() -> Void)?
 
-    private static let credentialsKey = "google-credentials"
+    nonisolated private static let credentialsKey = "google-credentials"
     nonisolated private static func imapKey(_ accountId: String) -> String { "imap-account:\(accountId)" }
 
     init() {
         let settings = settingsStore.load()
         self.settings = settings
         let keychain = self.keychain
-        self.googleCredentialsSet = keychain.get(GoogleCredentials.self, forKey: Self.credentialsKey) != nil
+        // Resolved below, off the main thread: a Keychain read can block on a
+        // user prompt (e.g. a differently-signed dev build reading items the
+        // release created), and this runs before the tray icon exists.
+        self.googleCredentialsSet = false
         let oauth = GoogleOAuth(keychain: keychain) {
             keychain.get(GoogleCredentials.self, forKey: Self.credentialsKey)
         }
@@ -59,6 +62,9 @@ final class AppModel: ObservableObject {
             self.startPolling()
             self.syncLocalApi()
             if settings.notify { Self.requestNotificationPermission() }
+            self.googleCredentialsSet = await Task.detached {
+                keychain.get(GoogleCredentials.self, forKey: Self.credentialsKey) != nil
+            }.value
         }
     }
 
