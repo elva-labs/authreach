@@ -153,6 +153,8 @@ final class AppModel: ObservableObject {
     /// message so the sheet can show it inline.
     func addImapAccount(email: String, credentials: ImapCredentials) async throws {
         try await imap.verify(credentials)
+        // The sheet was cancelled while we were connecting: save nothing.
+        try Task.checkCancellation()
         let accountId = UUID().uuidString
         try keychain.set(credentials, forKey: Self.imapKey(accountId))
         settings = try settingsStore.update { s in
@@ -166,7 +168,9 @@ final class AppModel: ObservableObject {
     func disconnect(account: ConnectedAccount) {
         switch account.provider {
         case .google: oauth.signOut(accountId: account.id)
-        case .imap: keychain.remove(forKey: Self.imapKey(account.id))
+        case .imap:
+            keychain.remove(forKey: Self.imapKey(account.id))
+            Task { [imap] in await imap.forget(accountId: account.id) }
         }
         do {
             settings = try settingsStore.update { s in

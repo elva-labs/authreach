@@ -27,8 +27,8 @@ public enum MimeParser {
         let text = String(data: raw, encoding: .isoLatin1) ?? String(decoding: raw, as: UTF8.self)
         var mail = ParsedMail()
         let (headers, body) = splitHeaders(text)
-        mail.subject = decodeEncodedWords(header(headers, "Subject"))
-        mail.from = decodeEncodedWords(header(headers, "From"))
+        mail.subject = decodeEncodedWords(utf8Header(header(headers, "Subject")))
+        mail.from = decodeEncodedWords(utf8Header(header(headers, "From")))
         mail.date = parseDate(header(headers, "Date"))
         collectText(headers: headers, body: body, into: &mail, depth: 0)
         return mail
@@ -60,6 +60,15 @@ public enum MimeParser {
 
     static func header(_ headers: [Header], _ name: String) -> String {
         headers.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.value ?? ""
+    }
+
+    /// Header values are Latin-1 here like the rest of the message, but raw
+    /// 8-bit header text is UTF-8 in practice (RFC 6532), so re-read the
+    /// bytes as UTF-8 when they form valid UTF-8. Plain ASCII is unchanged.
+    static func utf8Header(_ value: String) -> String {
+        guard let bytes = value.data(using: .isoLatin1),
+              let utf8 = String(data: bytes, encoding: .utf8) else { return value }
+        return utf8
     }
 
     private static func collectText(headers: [Header], body: String, into mail: inout ParsedMail, depth: Int) {
@@ -246,14 +255,20 @@ public enum MimeParser {
         var text = value.replacingOccurrences(of: #"\s*\([^)]*\)\s*$"#, with: "", options: .regularExpression)
         text = text.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return nil }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        for format in ["EEE, d MMM yyyy HH:mm:ss Z", "d MMM yyyy HH:mm:ss Z",
-                       "EEE, d MMM yyyy HH:mm:ss zzz", "d MMM yyyy HH:mm:ss zzz",
-                       "EEE, d MMM yyyy HH:mm Z", "d MMM yyyy HH:mm Z"] {
-            formatter.dateFormat = format
+        for formatter in dateFormatters {
             if let date = formatter.date(from: text) { return date }
         }
         return nil
+    }
+
+    private static let dateFormatters: [DateFormatter] = [
+        "EEE, d MMM yyyy HH:mm:ss Z", "d MMM yyyy HH:mm:ss Z",
+        "EEE, d MMM yyyy HH:mm:ss zzz", "d MMM yyyy HH:mm:ss zzz",
+        "EEE, d MMM yyyy HH:mm Z", "d MMM yyyy HH:mm Z",
+    ].map { format in
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = format
+        return formatter
     }
 }

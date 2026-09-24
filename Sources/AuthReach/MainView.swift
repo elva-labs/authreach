@@ -215,6 +215,7 @@ struct ImapAccountSheet: View {
     @State private var password = ""
     @State private var isConnecting = false
     @State private var error: String?
+    @State private var connectTask: Task<Void, Never>?
 
     /// Hosts for common providers, filled in from the address domain.
     private static let knownHosts: [String: String] = [
@@ -223,7 +224,6 @@ struct ImapAccountSheet: View {
         "fastmail.com": "imap.fastmail.com", "fastmail.fm": "imap.fastmail.com",
         "yahoo.com": "imap.mail.yahoo.com", "yahoo.se": "imap.mail.yahoo.com",
         "gmx.com": "imap.gmx.com", "gmx.de": "imap.gmx.net", "gmx.net": "imap.gmx.net",
-        "proton.me": "127.0.0.1", "protonmail.com": "127.0.0.1", // Proton Mail Bridge
     ]
 
     private var canConnect: Bool {
@@ -267,7 +267,11 @@ struct ImapAccountSheet: View {
             HStack {
                 if isConnecting { ProgressView().controlSize(.small) }
                 Spacer()
-                Button("Cancel") { isPresented = false }.keyboardShortcut(.cancelAction)
+                Button("Cancel") {
+                    connectTask?.cancel()
+                    isPresented = false
+                }
+                .keyboardShortcut(.cancelAction)
                 Button("Connect") { connect() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!canConnect)
@@ -292,12 +296,12 @@ struct ImapAccountSheet: View {
             port: port,
             username: username.isEmpty ? trimmedEmail : username.trimmingCharacters(in: .whitespaces),
             password: password)
-        Task {
+        connectTask = Task {
             do {
                 try await model.addImapAccount(email: trimmedEmail, credentials: credentials)
                 isPresented = false
             } catch {
-                self.error = error.localizedDescription
+                if !Task.isCancelled { self.error = error.localizedDescription }
             }
             isConnecting = false
         }

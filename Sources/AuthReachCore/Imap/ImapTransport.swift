@@ -19,7 +19,15 @@ enum ImapError: LocalizedError, Sendable {
     case unexpected(String)
     case authentication(String)
     case server(command: String, message: String)
-    case messageNotInBatch(String)
+
+    /// The connection itself failed (as opposed to the server refusing a
+    /// command), so the same request may succeed on a fresh connection.
+    var isTransport: Bool {
+        switch self {
+        case .connection, .timedOut: return true
+        default: return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -29,7 +37,6 @@ enum ImapError: LocalizedError, Sendable {
         case .unexpected(let detail): return "Unexpected IMAP response: \(detail.prefix(200))"
         case .authentication(let detail): return "IMAP sign-in was rejected: \(detail.prefix(200))"
         case .server(let command, let message): return "IMAP \(command) failed: \(message.prefix(200))"
-        case .messageNotInBatch(let id): return "IMAP message \(id) is not in the current batch."
         }
     }
 }
@@ -69,6 +76,12 @@ final class NWImapTransport: ImapTransport, @unchecked Sendable {
         let once = OnceFlag()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // Cancelled before we got here: onCancel already ran, and a
+                // connection cancelled before start() may never report a state.
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
                 connection.stateUpdateHandler = { [connection] state in
                     switch state {
                     case .ready:

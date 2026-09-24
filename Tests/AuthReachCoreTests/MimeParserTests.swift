@@ -71,6 +71,22 @@ final class MimeParserTests: XCTestCase {
         XCTAssertEqual(mail.plain, ["Code: 135790"])
     }
 
+    func testRawUtf8HeadersAreDecoded() {
+        // RFC 6532: 8-bit UTF-8 straight in the header, no encoded words.
+        let raw = "From: Säker Bank <no@bank.se>\r\nSubject: Din säkerhetskod\r\n\r\nKoden är 481920\r\n"
+        let mail = MimeParser.parse(Data(raw.utf8))
+        XCTAssertEqual(mail.subject, "Din säkerhetskod")
+        XCTAssertEqual(mail.from, "Säker Bank <no@bank.se>")
+    }
+
+    func testLatin1HeaderBytesAreKept() {
+        // Not valid UTF-8, so the Latin-1 reading stands.
+        var raw = Data("Subject: G".utf8)
+        raw.append(0xE4)
+        raw.append(Data("ller\r\n\r\nbody\r\n".utf8))
+        XCTAssertEqual(MimeParser.parse(raw).subject, "Gäller")
+    }
+
     func testMissingContentTypeIsPlainText() {
         let mail = MimeParser.parse(Data("Subject: Hi\r\n\r\nYour code is 246810\r\n".utf8))
         XCTAssertEqual(mail.text, "Your code is 246810")

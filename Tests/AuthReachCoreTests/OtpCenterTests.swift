@@ -8,15 +8,15 @@ final class StubInbox: InboxProvider, @unchecked Sendable {
     var baseline: Double = 1000
     var failNext = false
     var resetNext = false
+    /// Makes each fetch take this long, to hold a poll in flight.
+    var delayNanos: UInt64 = 0
 
     func initialWatermark(accountId: String) async throws -> Double { baseline }
-    func listMessageIds(accountId: String, after watermark: Double) async throws -> [String] {
+    func messages(accountId: String, after watermark: Double, skipping: Set<String>) async throws -> [FetchedMessage] {
+        if delayNanos > 0 { try await Task.sleep(nanoseconds: delayNanos) }
         if failNext { failNext = false; throw NSError(domain: "stub", code: 1, userInfo: [NSLocalizedDescriptionKey: "inbox offline"]) }
         if resetNext { resetNext = false; throw InboxProviderError.baselineReset }
-        return mailbox.filter { $0.receivedAt / 1000 > watermark }.map(\.id)
-    }
-    func message(accountId: String, id: String) async throws -> FetchedMessage {
-        mailbox.first { $0.id == id }!
+        return mailbox.filter { $0.receivedAt / 1000 > watermark && !skipping.contains($0.id) }
     }
     func watermark(for message: FetchedMessage) -> Double { message.receivedAt / 1000 }
 }
@@ -143,6 +143,30 @@ final class OtpCenterTests: XCTestCase {
         XCTAssertEqual(recent.first { $0.code == "222222" }?.accountEmail, "i@example.com")
     }
 
+    func testOverlappingPollsProcessEachMessageOnce() async {
+        await center.pollAll()
+        inbox.mailbox = [mail("m1", at: 1010, subject: "Login code 222222")]
+        inbox.delayNanos = 200_000_000
+        let notified = Tally()
+        await center.setOnNewCode { _ in notified.increment() }
+        // A timer tick firing while the previous (slow) poll is still running.
+        async let first: Void = center.pollAll()
+        async let second: Void = center.pollAll()
+        _ = await (first, second)
+        XCTAssertEqual(notified.value, 1)
+    }
+
+    func testAccountRemovedMidPollIsNotResurrected() async throws {
+        await center.pollAll()
+        inbox.delayNanos = 200_000_000
+        async let poll: Void = center.pollAll()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await center.configureAccounts([])
+        await poll
+        let runtime = await center.runtime(accountId: "a1")
+        XCTAssertNil(runtime)
+    }
+
     func testRemovedAccountStopsPolling() async {
         await center.configureAccounts([])
         inbox.mailbox = [mail("m1", at: 1010, subject: "code 555555")]
@@ -150,6 +174,13 @@ final class OtpCenterTests: XCTestCase {
         let recent = await center.recent
         XCTAssertTrue(recent.isEmpty)
     }
+}
+
+final class Tally: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func increment() { lock.lock(); count += 1; lock.unlock() }
 }
 
 final class GmailParsingTests: XCTestCase {

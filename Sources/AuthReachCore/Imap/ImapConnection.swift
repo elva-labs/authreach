@@ -32,35 +32,86 @@ actor ImapConnection {
         }
     }
 
+    /// A piece of a command line: plain text, or a synchronizing literal
+    /// (`{n}` CRLF, wait for the server's "+", then the raw bytes) for
+    /// values that can't be sent as a quoted string.
+    enum Part: Sendable, Equatable {
+        case text(String)
+        case literal(Data)
+    }
+
     /// Sends one command and returns its untagged responses. `label` names
     /// the command in errors (never echo LOGIN arguments).
     @discardableResult
     func command(_ text: String, label: String) async throws -> [ImapResponse] {
+        try await command([.text(text)], label: label)
+    }
+
+    @discardableResult
+    func command(_ parts: [Part], label: String) async throws -> [ImapResponse] {
         tagCounter += 1
         let tag = "A\(tagCounter)"
-        let transport = self.transport
-        let payload = Data("\(tag) \(text)\r\n".utf8)
-        try await withImapTimeout(seconds: Self.readTimeout, "sending \(label)") { try await transport.send(payload) }
-
         var untagged: [ImapResponse] = []
-        while true {
-            var line = try await readLine()
-            var literals: [Data] = []
-            while let length = Self.literalLength(line) {
-                literals.append(try await readExactly(length))
-                line.append(try await readLine())
+        var pending = Data("\(tag) ".utf8)
+        for part in parts {
+            switch part {
+            case .text(let text):
+                pending.append(Data(text.utf8))
+            case .literal(let bytes):
+                pending.append(Data("{\(bytes.count)}\r\n".utf8))
+                try await send(pending, label: label)
+                pending = bytes
+                // The server must say "+" before it takes the literal bytes.
+                awaitingContinuation: while true {
+                    switch try await readResponse(tag: tag, label: label) {
+                    case .continuation: break awaitingContinuation
+                    case .untagged(let response): untagged.append(response)
+                    case .done: throw ImapError.unexpected("\(label) completed before its literal was sent")
+                    }
+                }
             }
-            let str = String(decoding: line, as: UTF8.self)
-            if str.hasPrefix(tag + " ") {
-                let rest = str.dropFirst(tag.count + 1)
-                let status = rest.prefix { $0 != " " }
-                let message = rest.dropFirst(status.count).trimmingCharacters(in: .whitespaces)
-                if status == "OK" { return untagged }
-                throw ImapError.server(command: label, message: Self.stripResponseCode(message))
-            }
-            if str.hasPrefix("+") { continue } // continuation request; unused
-            untagged.append(ImapResponse(text: str, literals: literals))
         }
+        pending.append(Self.crlf)
+        try await send(pending, label: label)
+
+        while true {
+            switch try await readResponse(tag: tag, label: label) {
+            case .continuation: continue // not expected after the final line; ignore
+            case .untagged(let response): untagged.append(response)
+            case .done: return untagged
+            }
+        }
+    }
+
+    private enum Response {
+        case continuation
+        case untagged(ImapResponse)
+        /// The command's tagged OK. NO/BAD are thrown instead.
+        case done
+    }
+
+    private func readResponse(tag: String, label: String) async throws -> Response {
+        var line = try await readLine()
+        var literals: [Data] = []
+        while let length = Self.literalLength(line) {
+            literals.append(try await readExactly(length))
+            line.append(try await readLine())
+        }
+        let str = String(decoding: line, as: UTF8.self)
+        if str.hasPrefix(tag + " ") {
+            let rest = str.dropFirst(tag.count + 1)
+            let status = rest.prefix { $0 != " " }
+            let message = rest.dropFirst(status.count).trimmingCharacters(in: .whitespaces)
+            if status == "OK" { return .done }
+            throw ImapError.server(command: label, message: Self.stripResponseCode(message))
+        }
+        if str.hasPrefix("+") { return .continuation }
+        return .untagged(ImapResponse(text: str, literals: literals))
+    }
+
+    private func send(_ payload: Data, label: String) async throws {
+        let transport = self.transport
+        try await withImapTimeout(seconds: Self.readTimeout, "sending \(label)") { try await transport.send(payload) }
     }
 
     /// Best-effort LOGOUT, then drop the socket. Safe to call repeatedly.
